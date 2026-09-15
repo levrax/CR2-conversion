@@ -24,7 +24,25 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SPEC = ROOT / "cr2app.spec"
-APP_NAME = "CR2 Converter"
+
+
+def _app_name() -> str:
+    """Имя приложения читаем ИЗ СПЕКИ, а не дублируем здесь.
+
+    Второй экземпляр строки «CR2 Converter» рано или поздно разойдётся с первым,
+    и скрипт начнёт искать в dist папку, которой нет, сообщая о провале удачной
+    сборки.  Поэтому единственный источник истины — APP_NAME в cr2app.spec.
+    """
+    try:
+        for line in SPEC.read_text(encoding="utf-8").splitlines():
+            if line.startswith("APP_NAME"):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return "CR2 Converter"
+
+
+APP_NAME = _app_name()
 
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -33,6 +51,16 @@ IS_MAC = sys.platform == "darwin"
 # --------------------------------------------------------------------------
 # Мелочи
 # --------------------------------------------------------------------------
+
+
+# Вывод перенаправляют в файл (build.log), а кодировка файла берётся из локали,
+# а не из консоли.  На системе, где локаль не умеет кириллицу, print() свалился
+# бы с UnicodeEncodeError и убил сборку на ровном месте — заменяем непечатаемое.
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:                                   # pragma: no cover
+    pass
 
 
 def say(msg: str = "") -> None:
