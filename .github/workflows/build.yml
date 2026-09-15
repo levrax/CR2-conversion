@@ -159,8 +159,37 @@ jobs:
           PY
 
       # Тесты идут ДО сборки и валят задачу при любой ошибке.
+      #
+      # Запускаются через unittest API, а не `python -m unittest`, ради одного:
+      # каждый провал печатается как ::error::. Такие аннотации видны в
+      # публичном API проверок, тогда как сам лог задачи требует авторизации —
+      # без этого падение CI выглядит как голое "exit code 1" и не
+      # диагностируется вообще.
       - name: Run test suite
-        run: python -m unittest discover -v -t . -s . -p "test_*.py"
+        run: |
+          python - <<'PY'
+          import io, sys, unittest
+
+          buf = io.StringIO()
+          suite = unittest.TestLoader().discover('.', pattern='test_*.py',
+                                                 top_level_dir='.')
+          result = unittest.TextTestRunner(stream=buf, verbosity=2).run(suite)
+          sys.stdout.write(buf.getvalue())
+
+          if not result.wasSuccessful():
+              for kind, entries in (("FAIL", result.failures),
+                                    ("ERROR", result.errors)):
+                  for test, tb in entries:
+                      body = "%s: %s\n%s" % (kind, test, tb)
+                      body = body.replace("\r", "")[:2000]
+                      print("::error::" + body.replace("\n", "%0A"))
+              print("::error::%s: провалов %d, ошибок %d, всего тестов %d"
+                    % (sys.platform, len(result.failures), len(result.errors),
+                       result.testsRun))
+              sys.exit(1)
+
+          print("тестов пройдено: %d" % result.testsRun)
+          PY
 
       - name: Resolve version
         id: ver
