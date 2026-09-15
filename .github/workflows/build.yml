@@ -1,0 +1,232 @@
+# Сборка и релиз конвертера CR2 (Windows + macOS).
+#
+# PyInstaller НЕ УМЕЕТ кросс-компиляцию: каждую ОС надо собирать на её же
+# раннере. Отсюда матрица из трёх задач.
+name: Build and release
+
+on:
+  push:
+    branches: ['**']
+    # Фильтр веток НЕ срабатывает на пуш тега - теги надо перечислять отдельно.
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# По умолчанию токен только на чтение; права на запись поднимает лишь job release.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Сборку тега никогда не отменяем на полпути.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  PYTHON_VERSION: '3.12'
+
+defaults:
+  run:
+    # bash есть на всех раннерах (на Windows - Git Bash), один синтаксис везде.
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Тесты + сборка. Одна задача на ОС/архитектуру.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.slug }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            slug: windows-x64
+            arch: x64
+          - os: macos-latest
+            slug: macos-arm64
+            arch: arm64
+          # Intel-раннер. Образ macos-13 снят с обслуживания 04.12.2025,
+          # штатная замена для x86_64 - macos-15-intel.
+          - os: macos-15-intel
+            slug: macos-x86_64
+            arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            # На macOS x86_64 у rawpy нет колёс на PyPI (только macosx_11_0_arm64),
+            # поэтому при неудаче ставим по одному и не валим сборку
+            # из-за необязательной зависимости.
+            if ! python -m pip install -r requirements.txt; then
+              echo "::warning::requirements.txt целиком не поставился, ставим по одному пакету"
+              while read -r req; do
+                req="$(echo "$req" | sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+                if [ -z "$req" ]; then
+                  continue
+                fi
+                python -m pip install "$req" || echo "::warning::пакет $req недоступен на ${{ matrix.slug }}, пропущен"
+              done < requirements.txt
+            fi
+          else
+            echo "::warning::requirements.txt не найден - ставим только pyinstaller"
+          fi
+          python -m pip install pyinstaller
+          python -m pip list
+
+      - name: Show toolchain
+        run: |
+          python -VV
+          python -c "import platform, _tkinter; print('machine:', platform.machine(), 'Tcl', _tkinter.TCL_VERSION, 'Tk', _tkinter.TK_VERSION)"
+          pyinstaller --version
+
+      # Тесты идут ДО сборки и валят задачу при любой ошибке.
+      - name: Run test suite
+        run: python -m unittest discover -v -t . -s . -p "test_*.py"
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0+${GITHUB_SHA:0:7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      - name: Locate the .spec file
+        id: spec
+        run: |
+          if [ -f cr2_gui.spec ]; then
+            spec=cr2_gui.spec
+          else
+            spec="$(ls -1 *.spec 2>/dev/null | head -n 1)"
+          fi
+          if [ -z "$spec" ]; then
+            echo "::error::В корне репозитория нет .spec файла для PyInstaller"
+            exit 1
+          fi
+          echo "spec=$spec" >> "$GITHUB_OUTPUT"
+          echo "Using spec: $spec"
+
+      - name: Build with PyInstaller
+        run: |
+          python -m PyInstaller --noconfirm --clean --log-level=INFO "${{ steps.spec.outputs.spec }}"
+          ls -la dist
+
+      # --- Упаковка: Windows ---------------------------------------------------
+      - name: Package (Windows, zip onedir)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p artifacts
+          app="$(find dist -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          if [ -z "$app" ]; then
+            echo "::error::onedir-папка в dist не найдена"
+            exit 1
+          fi
+          appname="$(basename "$app")"
+          out="artifacts/$appname-${{ steps.ver.outputs.version }}-windows-x64.zip"
+          # 7-Zip предустановлен на образе windows; сохраняем верхнюю папку,
+          # чтобы распаковка не рассыпала сотни файлов в Downloads.
+          7z a -tzip -mx=9 "$out" "./dist/$appname" > /dev/null
+          7z l "$out" | tail -n 3
+
+      # --- Упаковка: macOS -----------------------------------------------------
+      - name: Package (macOS, ditto .app)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p artifacts
+          app="$(find dist -mindepth 1 -maxdepth 1 -name '*.app' | head -n 1)"
+          if [ -z "$app" ]; then
+            echo "::error::.app бандл в dist не найден"
+            exit 1
+          fi
+          appname="$(basename "$app" .app)"
+          out="artifacts/$appname-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}.zip"
+          codesign --display --verbose=2 "$app" || true
+          # ditto, а НЕ zip: внутри .app симлинки (Frameworks/Resources связаны
+          # перекрёстно) и расширенные атрибуты с подписью. zip их теряет,
+          # после чего бандл может не запуститься на Apple Silicon.
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$out"
+          unzip -l "$out" | tail -n 3
+
+      - name: Checksums
+        run: |
+          tmp="$(mktemp)"
+          (
+            cd artifacts
+            for f in *; do
+              if [ -f "$f" ]; then
+                if command -v sha256sum > /dev/null 2>&1; then
+                  sha256sum "$f"
+                else
+                  shasum -a 256 "$f"
+                fi
+              fi
+            done
+          ) > "$tmp"
+          mv "$tmp" "artifacts/SHA256SUMS-${{ matrix.slug }}.txt"
+          cat "artifacts/SHA256SUMS-${{ matrix.slug }}.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          # Имя артефакта обязано быть уникальным внутри одного запуска.
+          name: CR2-${{ matrix.slug }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # 2. Релиз: только на тег v* и только когда вся матрица зелёная.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist-artifacts
+          pattern: CR2-*
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lR dist-artifacts
+
+      - name: Merge checksum files
+        run: |
+          cd dist-artifacts
+          cat SHA256SUMS-*.txt > SHA256SUMS.txt
+          rm -f SHA256SUMS-*.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release and attach every platform build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # gh делает draft -> заливает файлы -> публикует; только такой порядок
+        # работает в репозиториях с включёнными immutable releases.
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist-artifacts/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

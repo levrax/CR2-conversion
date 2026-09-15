@@ -1,0 +1,39 @@
+# Сборка PyInstaller
+build/
+dist/
+artifacts/
+
+# Байт-код и кэши Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+
+# Рабочие файлы самого приложения (не коммитить)
+cr2_gui_error.log
+cr2_gui_settings.json
+
+# Временные файлы
+*.tmp
+*.temp
+
+# Мусор ОС и редакторов
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# ВНИМАНИЕ: *.spec НЕ игнорируется намеренно.
+# cr2_gui.spec - это исходник сборки, он должен быть в репозитории.
