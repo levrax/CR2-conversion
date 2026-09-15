@@ -6,9 +6,16 @@ name: Build and release
 
 on:
   push:
-    branches: ['**']
+    # ТОЛЬКО основная ветка. При branches: ['**'] пуш в ветку с открытым PR
+    # запускает и push, и pull_request - а group концуррентности содержит
+    # github.ref, который у этих событий РАЗНЫЙ (refs/heads/X против
+    # refs/pull/N/merge), так что ни один прогон не отменяет другой: 6 задач
+    # вместо 3, включая два macOS-раннера по множителю x10.
+    branches: [main]
     # Фильтр веток НЕ срабатывает на пуш тега - теги надо перечислять отдельно.
-    tags: ['v*']
+    # Шаблон сужен до версии: 'v*' ловил и черновые теги (vnext, verify-ci),
+    # каждый из которых публиковал НАСТОЯЩИЙ релиз с бинарниками.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
   pull_request:
   workflow_dispatch:
 
@@ -37,6 +44,16 @@ jobs:
     name: build (${{ matrix.slug }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
+    env:
+      # На windows-latest локаль en-US, ACP=1252, а вывод шага уходит в канал,
+      # поэтому Python берёт кодировку локали и ЛЮБОЙ print() с кириллицей в
+      # шагах ниже падает с UnicodeEncodeError - в том числе на успешном пути.
+      # Именно PYTHONIOENCODING, а не PYTHONUTF8=1: последний меняет ещё и
+      # кодировку open() по умолчанию, а тесты намеренно читают файлы не в
+      # UTF-8 (test_settings_survive_a_non_utf8_rewrite).
+      # NB: на ЗАМОРОЖЕННЫЙ exe это не влияет - PyInstaller стартует CPython с
+      # use_environment=0, см. дымовой тест ниже.
+      PYTHONIOENCODING: 'utf-8'
     strategy:
       fail-fast: false
       matrix:
@@ -190,9 +207,16 @@ jobs:
 
       # Дымовой тест собранного бандла. Консольный exe для того и собирается.
       # ВАЖНО: сравнивать текст через grep нельзя - замороженный CLI пишет в
-      # кодировке консоли (на Windows это cp1251) и PYTHONIOENCODING не
-      # слушает, так что UTF-8-шаблон не совпал бы НИ НА ОДНОЙ сборке.
+      # кодировке ANSI-страницы системы и НЕ слушает ни PYTHONIOENCODING, ни
+      # PYTHONUTF8 (PyInstaller стартует CPython с use_environment=0).
       # Декодируем явно. Код возврата --version равен 0 и в урезанном случае.
+      #
+      # И второе, менее очевидное: Console в cr2_convert.py САМ транслитерирует
+      # кириллицу, если она не лезет в кодировку потока (cyrillic = _can("Я")).
+      # На раннере GitHub локаль en-US, ACP=1252, 'Я'.encode('cp1252') падает -
+      # и «есть» выходит как «est». Поэтому принимаем ОБА написания маркера.
+      # «нет» транслитерируется в «net», так что проверка по-прежнему отличает
+      # полный бандл от урезанного, а не просто всегда зелёная.
       - name: Smoke-test the built bundle
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -201,10 +225,12 @@ jobs:
             exe="dist/CR2 Converter.app/Contents/MacOS/CR2 Converter CLI"
           fi
           python - "$exe" <<'PY'
-          import subprocess, sys
+          import re, subprocess, sys
           out = subprocess.run([sys.argv[1], "--version"],
                                capture_output=True, check=True).stdout
-          for enc in ("utf-8", "cp1251", "cp866"):
+          # cp866 ДО cp1251: cp1251 декодирует почти любой байтовый мусор и
+          # молча увёл бы cp866-вывод в кракозябры вместо перехода к следующей.
+          for enc in ("utf-8", "cp866", "cp1251"):
               try:
                   text = out.decode(enc)
                   break
@@ -214,8 +240,13 @@ jobs:
               sys.exit("не удалось декодировать вывод: %r" % out)
           print(text.strip())
           for dep in ("Pillow", "rawpy"):
-              if "%s: есть" % dep not in text:
-                  sys.exit("::error::%s отсутствует в собранном бандле" % dep)
+              m = re.search(r"%s: (есть|est|нет|net)" % dep, text)
+              if m is None:
+                  sys.exit("::error::в выводе --version нет строки про %s "
+                           "(вывод: %s)" % (dep, text.strip()))
+              if m.group(1) in ("нет", "net"):
+                  sys.exit("::error::%s отсутствует в собранном бандле "
+                           "(вывод: %s)" % (dep, text.strip()))
           PY
 
       # LSBackgroundOnly=true делает .app фоновым агентом: ни значка в Dock, ни
@@ -255,9 +286,15 @@ jobs:
             exit 1
           fi
           appname="$(basename "$app")"
-          out="artifacts/$appname-${{ steps.ver.outputs.version }}-windows-x64.zip"
+          # Имя ассета GitHub нормализует при заливке: пробелы (и `+`)
+          # заменяются точками, а SHA256SUMS.txt публикуется как есть - после
+          # чего `sha256sum -c` не находит НИ ОДНОГО файла. Пробел убираем сами.
+          safename="${appname// /-}"
+          out="artifacts/$safename-${{ steps.ver.outputs.version }}-windows-x64.zip"
           # 7-Zip предустановлен на образе windows; сохраняем верхнюю папку,
           # чтобы распаковка не рассыпала сотни файлов в Downloads.
+          # ВНИМАНИЕ: источник для 7z - "$appname" (С пробелом), это реальный
+          # путь в dist; подменять его на $safename нельзя, папки такой нет.
           7z a -tzip -mx=9 "$out" "./dist/$appname" > /dev/null
           7z l "$out" | tail -n 3
 
@@ -272,7 +309,10 @@ jobs:
             exit 1
           fi
           appname="$(basename "$app" .app)"
-          out="artifacts/$appname-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}.zip"
+          # См. комментарий в windows-шаге: GitHub заменит пробел точкой при
+          # заливке, и SHA256SUMS.txt перестанет сходиться с именами ассетов.
+          safename="${appname// /-}"
+          out="artifacts/$safename-${{ steps.ver.outputs.version }}-macos-${{ matrix.arch }}.zip"
           codesign --display --verbose=2 "$app" || true
           # ditto, а НЕ zip: внутри .app симлинки (Frameworks/Resources связаны
           # перекрёстно) и расширенные атрибуты с подписью. zip их теряет,
@@ -328,6 +368,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Язык выражений в `if:` не умеет регулярных выражений, поэтому форму
+      # тега проверяем здесь, до первой публикующей команды.  Фильтр в on.push
+      # уже сузил запуск, но тег можно навесить и на ручной прогон, а цена
+      # ошибки - публичный релиз с бинарниками, который увидят все.
+      - name: Reject tags that are not vN.N.N
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Тег $tag не похож на версию (ожидается vN.N.N) - релиз не публикуется"
+            exit 1
+          fi
+
       - name: Download all platform artifacts
         uses: actions/download-artifact@v8
         with:

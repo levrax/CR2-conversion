@@ -1863,17 +1863,29 @@ _case_fold_guard = threading.Lock()
 def _swapcase_probe(folder: str) -> str | None:
     """`folder` with the case of its deepest lettered component flipped.
 
-    None when no component carries a letter, in which case the caller cannot
-    probe this way.
+    The result always addresses THE SAME directory as `folder` on a
+    case-insensitive volume: only the spelling of one component changes, the
+    components BELOW it are kept.  Returning an ancestor instead (as an earlier
+    version did, by discarding the tail it walked past) makes _fs_folds_case
+    compare the inodes of two different directories, which can only ever answer
+    "case-sensitive" - the unsafe side for _dst_key, where a missed collision
+    costs a photo.
+
+    None when no component within a few levels carries a letter, or when
+    flipping the case is a no-op (a caseless script such as 写真, עברית, ไทย).
+    The caller then falls back to its own safe `default`.
     """
-    head, tail = os.path.split(folder)
+    cur = folder
+    tail_parts: list[str] = []
     for _ in range(4):                       # walk up a few levels, then give up
+        head, tail = os.path.split(cur)
         if any(ch.isalpha() for ch in tail):
-            return os.path.join(head, tail.swapcase())
-        if not head or head == folder:
+            probe = os.path.join(head, tail.swapcase(), *reversed(tail_parts))
+            return probe if probe != folder else None
+        if not head or head == cur:
             return None
-        folder = head
-        head, tail = os.path.split(head)
+        tail_parts.append(tail)
+        cur = head
     return None
 
 
@@ -1888,6 +1900,11 @@ def _fs_folds_case(folder: Path, *, default: bool) -> bool:
     `default` is what to assume when the probe cannot run (folder missing, no
     letters in the path, stat refused); callers pick the side that is safe for
     THEIR use, see _dst_key() and cr2_convert.collect_inputs().
+
+    Only a MEASURED answer is cached.  The cache is keyed on the folder alone
+    and is shared by callers with OPPOSITE safe defaults - _dst_key passes
+    True, input_key passes False - so memoising an unmeasured default would
+    hand whichever caller runs second the other one's unsafe side.
     """
     if _ON_NT:
         return True                          # normcase already folds
@@ -1897,7 +1914,7 @@ def _fs_folds_case(folder: Path, *, default: bool) -> bool:
     if hit is not None:
         return hit
 
-    result = default
+    result: bool | None = None               # tri-state: None = undecided
     probe = _swapcase_probe(key)
     if probe is not None and probe != key:
         try:
@@ -1914,6 +1931,9 @@ def _fs_folds_case(folder: Path, *, default: bool) -> bool:
                 result = (here.st_ino == there.st_ino
                           and here.st_dev == there.st_dev)
 
+    if result is None:
+        return default                       # undecided: never cache, never
+                                             # speak for the other caller
     with _case_fold_guard:
         _case_fold_cache[key] = result
     return result

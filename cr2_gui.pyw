@@ -762,27 +762,42 @@ except BaseException as _exc:          # нет tcl/tk в установке Pyt
 _error_box_shown = [0]
 
 
-def _show_error_box(summary: str, path: Path) -> None:
-    """Показать messagebox, но не более трёх раз за сеанс (защита от лавины)."""
+def _show_error_box(summary: str, path: Path) -> bool:
+    """Показать messagebox, но не более трёх раз за сеанс (защита от лавины).
+
+    Возвращает True, если окно ДЕЙСТВИТЕЛЬНО показано.  False означает, что
+    tkinter непригоден (нет tk.tcl, нет дисплея) и вызывающий код обязан
+    сообщить об ошибке сам.  Раньше функция глотала собственное исключение и
+    возвращалась молча - ровно на том отказе, ради которого написаны
+    native_error_dialog() и app._fatal(): пользователь видел, как значок
+    мигнул и пропал, без единого сообщения.
+    """
     if _error_box_shown[0] >= 3:
-        return
+        return True                                  # лавину гасим намеренно
     _error_box_shown[0] += 1
+    text = "%s\n\nПодробности записаны в файл:\n%s" % (summary, path)
+    created = None
     try:
         parent = tk._default_root                    # noqa: SLF001
-        created = None
         if parent is None:
             created = tk.Tk()
             created.withdraw()
             parent = created
-        messagebox.showerror(
-            "Непредвиденная ошибка",
-            "%s\n\nПодробности записаны в файл:\n%s" % (summary, path),
-            parent=parent,
-        )
-        if created is not None:
-            created.destroy()
+        messagebox.showerror("Непредвиденная ошибка", text, parent=parent)
     except Exception:
+        try:
+            if created is not None:
+                created.destroy()
+        except Exception:
+            pass
+        # Ровно тот случай, ради которого написан native_error_dialog.
+        return native_error_dialog("Конвертер CR2", text)
+    try:
+        if created is not None:
+            created.destroy()        # сбой destroy УЖЕ после показа окна:
+    except Exception:                # второе сообщение показывать не за что
         pass
+    return True
 
 
 def install_crash_hooks(root: tk.Misc | None = None) -> None:
@@ -1436,6 +1451,15 @@ class App(ttk.Frame):
         self._poll_id: str | None = None
         self._destroyed = False
 
+        # Тот же вопрос, что уже задают таблица (tag_configure ниже) и журнал,
+        # только про подписи: бандл разрешает тёмное оформление macOS
+        # (NSRequiresAquaSystemAppearance=False в cr2app.spec), и светлые цвета
+        # текста ложатся на почти чёрный фон - контраст падает до 1.4:1.
+        # Спрашиваем ОДИН раз: тема к этому моменту уже выбрана (apply_ui_theme
+        # в main), а менять её на ходу программа не умеет.  На Windows ответ
+        # False, цвета остаются ровно прежними.
+        self._dark_ui = ttk_style_is_dark(self, "TLabel")
+
         self._build_vars()
         self._build_ui()
         self._sync_option_states()
@@ -1487,6 +1511,15 @@ class App(ttk.Frame):
     def _px(self, value: float) -> int:
         return int(round(value * self.scale))
 
+    #: Светлый цвет -> тёмный двойник.  Пары подобраны под фон ~#323232
+    #: (тёмное оформление macOS) и совпадают с палитрой строк таблицы.
+    _DARK_FG = {
+        "#555555": "#a0a0a0",   # пояснение
+        "#8a4b00": "#ffc46b",   # предупреждение
+        "#a05000": "#ffb454",   # подсказка-блокировка
+        "#14521f": "#8fdca4",   # всё хорошо
+    }
+
     def _fg(self, color: str) -> dict:
         """Цвет текста для ttk-подписи.  Работает на всех трёх системах.
 
@@ -1499,7 +1532,14 @@ class App(ttk.Frame):
         Цвет в любом случае только подсказка: смысл каждой такой подписи
         написан словами, поэтому даже в теме, которая цвет проигнорирует,
         ничего не теряется.
+
+        А вот САМ цвет от фона зависит: при тёмном оформлении светлые значения
+        заменяются на парные тёмные, иначе подпись сливается с фоном (#14521f
+        на #323232 - это 1.4:1, текст просто не виден).  Незнакомый цвет
+        отдаётся как есть: прежнее поведение лучше, чем отсутствие цвета.
         """
+        if getattr(self, "_dark_ui", False):
+            color = self._DARK_FG.get(color, color)
         return {"foreground": color}
 
     def _build_ui(self) -> None:
@@ -2739,5 +2779,12 @@ if __name__ == "__main__":
         raise
     except Exception:
         path = record_error("main", traceback.format_exc())
-        _show_error_box("Приложение не смогло запуститься.", path)
+        if not _show_error_box("Приложение не смогло запуститься.", path):
+            # Ни tkinter, ни системное окно не сработали (или это CI).
+            # Тогда хотя бы не молчим в поток ошибок.
+            try:
+                sys.stderr.write(
+                    "Приложение не смогло запуститься. См. %s\n" % path)
+            except Exception:
+                pass
         sys.exit(1)

@@ -1,0 +1,20 @@
+# Переводы строк в репозитории — всегда LF.
+#
+# Без этого файла при core.autocrlf=true в коммиты уезжает CRLF, и GitHub
+# Actions ломается на всех платформах сразу: скрипт шага приходит на раннер
+# со строками, оканчивающимися на \r, терминатор heredoc "PY\r" не совпадает
+# с "PY", а в аргументы команд попадает лишний символ. Диагностируется тяжело:
+# в логе виден только "Process completed with exit code 1".
+* text=auto eol=lf
+
+# Батники исполняет cmd.exe — ему нужны родные CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Двоичное не трогать.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.CR2 binary

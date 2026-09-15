@@ -304,11 +304,21 @@ def main() -> int:
         raise
     except BaseException:
         # Тот же хвост, что в блоке __main__ самого cr2_gui.pyw.
+        tb = traceback.format_exc()
+        shown = False
         try:
-            path = gui.record_error("app.py main", traceback.format_exc())
-            gui._show_error_box("Приложение не смогло запуститься.", path)
+            path = gui.record_error("app.py main", tb)
+            # bool(): старая версия _show_error_box возвращала None, и тогда
+            # мы обязаны эскалировать, а не счесть окно показанным.
+            shown = bool(gui._show_error_box(
+                "Приложение не смогло запуститься.", path))
         except Exception:
-            _fatal("Приложение не смогло запуститься.", traceback.format_exc())
+            shown = False
+        if not shown:
+            # Сюда попадаем, когда непригоден САМ tkinter (нет tk.tcl после
+            # карантина антивируса, нет дисплея).  _fatal не возвращается:
+            # пишет журнал, показывает окно через ctypes/osascript, os._exit.
+            _fatal("Приложение не смогло запуститься.", tb)
         return 1
 
 
