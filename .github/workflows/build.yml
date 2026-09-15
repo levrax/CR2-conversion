@@ -272,6 +272,13 @@ jobs:
             echo "::error::Info.plist без NSHighResolutionCapable - окно будет мыльным на retina"
             exit 1
           fi
+          # icon=None у BUNDLE не значит «без значка»: PyInstaller подставит
+          # свой bootloader/images/icon-windowed.icns, и релизный .app уйдёт
+          # с чужим логотипом в Finder и в Dock.
+          if /usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$plist" 2>/dev/null | grep -qi '^icon-windowed'; then
+            echo "::error::CFBundleIconFile - значок PyInstaller, а не приложения (нужен assets/app.icns)"
+            exit 1
+          fi
 
       # --- Упаковка: Windows ---------------------------------------------------
       - name: Package (Windows, zip onedir)

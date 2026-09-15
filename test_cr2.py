@@ -1340,6 +1340,95 @@ class TestDestinationPlanning(Base):
                                 cr2_core.input_key(self.out / "a.CR2"))
         self.assertIs(probe_args["default"], False)
 
+    # -- настоящий зонд регистра (без mock.patch на _fs_folds_case) ---------
+    #
+    # Все тесты выше подменяют _fs_folds_case целиком, поэтому ни один из них
+    # не видит ни _swapcase_probe, ни кэш.  Именно там и жили две ошибки:
+    # зонд возвращал ПРЕДКА (и ответ всегда выходил «регистр важен»), а кэш
+    # запоминал чужой default.
+
+    def _volume_folds_case(self) -> bool:
+        """Правда ли текущий том склеивает регистр.  Для skip на CS-машинах."""
+        probe = str(self.out).swapcase()
+        try:
+            here, there = os.stat(str(self.out)), os.stat(probe)
+        except OSError:
+            return False
+        return here.st_ino == there.st_ino and here.st_dev == there.st_dev
+
+    def test_swapcase_probe_keeps_the_component_it_was_asked_about(self):
+        """Зонд обязан описывать ТУ ЖЕ папку, а не её предка.
+
+        Возврат предка означал сравнение inode двух РАЗНЫХ каталогов, то есть
+        вечный ответ «том регистрозависим» — и для _dst_key это опасная
+        сторона: пропущенная коллизия стоит снимка.
+        """
+        probe = cr2_core._swapcase_probe(os.path.join("/Users/bob/Pictures/2024"))
+        self.assertIsNotNone(probe, "у пути есть буквенный компонент")
+        self.assertEqual(os.path.basename(probe), "2024",
+                         "зонд потерял папку, о которой его спросили")
+        deep = cr2_core._swapcase_probe("/Users/bob/Pictures/2024/06/15")
+        self.assertIsNotNone(deep)
+        self.assertTrue(deep.replace("\\", "/").endswith("2024/06/15"))
+        # Бесписьменный хвост и корень зонду не по силам — это НЕ ошибка,
+        # вызывающий код тогда применяет собственный default.
+        self.assertIsNone(cr2_core._swapcase_probe("/2024"))
+        self.assertIsNone(cr2_core._swapcase_probe("/Users/bob/2024/06/15/20"))
+
+    def test_fs_folds_case_sees_through_a_digit_named_folder(self):
+        """Папка «2024» на регистронезависимом томе — всё ещё склеивает регистр.
+
+        Триггер не экзотический: любая папка из одних цифр — 2024, 06, 001 —
+        то есть обычное дерево импорта по датам.
+        """
+        if not self._volume_folds_case():
+            self.skipTest("том регистрозависим, проверять нечего")
+        d = self.out / "Pictures" / "2024"
+        d.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.dict(cr2_core._case_fold_cache, {}, clear=True):
+            self.assertTrue(cr2_core._fs_folds_case(d, default=True))
+
+    def test_plan_dedupes_into_a_digit_named_out_dir(self):
+        """IMG_/img_ в папку «2024» — одна пара, а не две разные цели."""
+        if not self._volume_folds_case():
+            self.skipTest("том регистрозависим, проверять нечего")
+        a = mk.make_cr2(self.out / "a" / "IMG_0042.CR2", preview_size=(64, 48),
+                        thumb_size=(32, 24), include_ifd2=False)
+        b = mk.make_cr2(self.out / "b" / "img_0042.CR2", preview_size=(66, 48),
+                        thumb_size=(32, 24), include_ifd2=False)
+        out = self.out / "2024"
+        out.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.dict(cr2_core._case_fold_cache, {}, clear=True):
+            plan = cr2_core.plan_destinations([a, b], ConvertOptions(out_dir=out))
+        self.assertNotEqual(plan[0][1].name.lower(), plan[1][1].name.lower(),
+                            "коллизия не разведена: два снимка в один файл")
+        self.assertTrue(plan[1][2], "переименование должно быть объяснено")
+
+    def test_undecided_probe_does_not_poison_the_other_caller(self):
+        """Кэш общий, а безопасные стороны у вызывающих ПРОТИВОПОЛОЖНЫЕ.
+
+        Имя из бесписьменного алфавита (写真, עברית, ไทย): swapcase ничего не
+        меняет, зонд бессилен.  Раньше в кэш ложился default первого
+        вызвавшего — и CLI, который сначала зовёт input_key(default=False) на
+        каждый файл, выключал склейку для _dst_key(default=True).
+        """
+        d = self.out / "写真"
+        d.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.dict(cr2_core._case_fold_cache, {}, clear=True):
+            self.assertIsNone(cr2_core._swapcase_probe(str(d)),
+                              "фикстура собрана неверно: зонд что-то смог")
+            # Порядок как в cr2_convert: сначала вход, потом назначение.
+            self.assertFalse(cr2_core._fs_folds_case(d, default=False))
+            self.assertTrue(cr2_core._fs_folds_case(d, default=True),
+                            "input_key отравил кэш для _dst_key")
+            # И в обратную сторону — вектор тот же, знак другой.
+            self.assertFalse(cr2_core._fs_folds_case(d, default=False))
+            self.assertEqual(cr2_core._case_fold_cache, {},
+                             "неизмеренный ответ не должен кэшироваться")
+
     def test_plan_is_deterministic(self):
         srcs = self.make_colliding(("x", "y", "z"))
         opts = ConvertOptions(out_dir=self.out / "o")

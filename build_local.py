@@ -261,6 +261,13 @@ def check_macos_plist(app: Path) -> int:
     if not data.get("NSHighResolutionCapable"):
         say("Info.plist  : нет NSHighResolutionCapable — окно будет мыльным")
         bad = 1
+    # icon=None у BUNDLE не значит «без значка»: osx.py подставляет
+    # bootloader/images/icon-windowed.icns, и бандл уходит с чужим логотипом.
+    if str(data.get("CFBundleIconFile", "")).startswith("icon-windowed"):
+        say("Info.plist  : CFBundleIconFile=%s — это значок PyInstaller,"
+            % data.get("CFBundleIconFile"))
+        say("              а не приложения. Нужен assets/app.icns.")
+        bad = 1
     say("Версия бандла: %s (CFBundleShortVersionString)"
         % data.get("CFBundleShortVersionString"))
     if not bad:
