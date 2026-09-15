@@ -228,15 +228,27 @@ jobs:
           import re, subprocess, sys
           out = subprocess.run([sys.argv[1], "--version"],
                                capture_output=True, check=True).stdout
-          # cp866 ДО cp1251: cp1251 декодирует почти любой байтовый мусор и
-          # молча увёл бы cp866-вывод в кракозябры вместо перехода к следующей.
-          for enc in ("utf-8", "cp866", "cp1251"):
+          # Однобайтовые кодировки декодируют ПОЧТИ ЛЮБЫЕ байты, поэтому
+          # «первая, которая не бросила исключение» - это монетка: cp866 молча
+          # превращает cp1251-«есть» в «хёЄ№», и проверка валится на исправном
+          # бандле.  Порядок тут не спасает ни в какую сторону (проверено на
+          # готовом exe с ACP=1251), поэтому берём ту кодировку, в которой
+          # маркер РЕАЛЬНО нашёлся, а не первую подошедшую.
+          marker = re.compile(r"(?:Pillow|rawpy): (?:есть|est|нет|net)")
+          text = fallback = None
+          for enc in ("utf-8", "cp1251", "cp866"):
               try:
-                  text = out.decode(enc)
-                  break
+                  cand = out.decode(enc)
               except UnicodeDecodeError:
                   continue
-          else:
+              if fallback is None:
+                  fallback = cand          # на случай сообщения об ошибке
+              if marker.search(cand):
+                  text = cand
+                  break
+          if text is None:
+              text = fallback
+          if text is None:
               sys.exit("не удалось декодировать вывод: %r" % out)
           print(text.strip())
           for dep in ("Pillow", "rawpy"):
