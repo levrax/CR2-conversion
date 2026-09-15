@@ -184,6 +184,34 @@ def enable_dpi_awareness() -> str:
         return "none"
 
 
+def honour_linux_scaling(root) -> float:
+    """Учесть масштаб рабочего стола на Linux.  Пустая операция где угодно ещё.
+
+    Windows и macOS обслуживают масштаб сами (см. enable_dpi_awareness), и
+    трогать их нельзя.  На Linux же часть окружений выставляет GDK_SCALE=2, но
+    оставляет Xft.dpi равным 96: Tk про такое увеличение не знает и рисует окно
+    вдвое мельче соседних.  Берём подсказку из окружения, и только если она
+    осмысленна.  CR2_UI_SCALE позволяет задать масштаб вручную, когда окружение
+    не сказало ничего.
+    """
+    if not IS_LINUX:
+        return 1.0
+    for name in ("CR2_UI_SCALE", "GDK_SCALE", "QT_SCALE_FACTOR"):
+        try:
+            value = float(os.environ.get(name) or 0)
+        except (TypeError, ValueError):
+            continue
+        if 1.0 < value <= 4.0:
+            try:
+                # tk scaling измеряется в пикселях на ТОЧКУ (1/72 дюйма),
+                # отсюда множитель 96/72 к привычному «во сколько раз».
+                root.tk.call("tk", "scaling", value * 96.0 / 72.0)
+                return value
+            except Exception:                           # pragma: no cover
+                return 1.0
+    return 1.0
+
+
 # ---------------- где лежит файл настроек ----------------
 
 
@@ -299,7 +327,12 @@ def reveal_in_file_manager(target) -> None:
     Бросает OSError, если открыть не удалось - вызывающий код показывает это
     пользователю.  Другие исключения наружу не выходят.
     """
-    path = os.path.normpath(str(target))
+    # abspath, а не только normpath.  На POSIX это гарантирует ведущую «/», а
+    # значит путь не будет разобран как ключ командной строки: папка с именем
+    # «-n» иначе уедет в разбор аргументов open/xdg-open.  На Windows для уже
+    # абсолютного пути abspath не меняет ничего, а относительный разворачивает
+    # ровно так же, как его до этого развернула проверка Path(target).is_dir().
+    path = os.path.normpath(os.path.abspath(str(target)))
     if IS_WINDOWS:
         starter = getattr(os, "startfile", None)
         if starter is None:                             # pragma: no cover
@@ -313,10 +346,14 @@ def reveal_in_file_manager(target) -> None:
         raise OSError("subprocess недоступен: %s" % exc)
 
     if IS_MACOS:
-        commands = [["open", path]]
+        # «--» завершает разбор ключей: open построен на getopt и понимает его.
+        commands = [["open", "--", path]]
     else:
         # xdg-open - стандарт freedesktop; gio есть везде, где есть GLib;
         # дальше конкретные менеджеры на случай голого окружения.
+        # «--» сюда подставлять НЕЛЬЗЯ: xdg-open разбирает его как неизвестный
+        # ключ и завершается с ошибкой синтаксиса.  От пути, начинающегося с
+        # дефиса, здесь защищает abspath выше, а не разделитель аргументов.
         commands = [["xdg-open", path], ["gio", "open", path],
                     ["nautilus", path], ["dolphin", path],
                     ["thunar", path], ["pcmanfm", path], ["nemo", path]]
@@ -326,8 +363,12 @@ def reveal_in_file_manager(target) -> None:
         try:
             # Popen, а не run: файловый менеджер живёт своей жизнью, ждать его
             # нельзя - иначе интерфейс замрёт до закрытия окна проводника.
+            # start_new_session: менеджер уходит в собственную группу
+            # процессов.  Тогда он переживает закрытие программы, а Ctrl+C в
+            # терминале, из которого запущен .py, не валит заодно и его.
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
             return
         except OSError as exc:      # нет такой программы - пробуем следующую
             last = exc
@@ -452,23 +493,162 @@ def apply_ui_theme(root=None) -> str:
         return ""
 
 
-def theme_honours_widget_colors(widget=None) -> bool:
-    """Слушается ли тема параметров -foreground/-background у ttk-виджетов.
+# Про цвета ttk в теме aqua (macOS), чтобы это не выяснялось заново.
+# Разница между двумя параметрами там принципиальная:
+#
+#   -background  ИГНОРИРУЕТСЯ: заливку ttk-виджета рисует сама система;
+#   -foreground  РАБОТАЕТ:     в aquaTheme.tcl нет ни одного style map на
+#                              TLabel -foreground, цвет текста доходит до
+#                              экрана и на macOS тоже.
+#
+# Программа НЕ задаёт -background ни одному ttk-виджету - ни одному, проверено
+# поиском по файлу, - поэтому терять на aqua нечего и проверять перед вызовом
+# тоже нечего: оформление вырождается само собой и правильно.  Цвет текста
+# (App._fg) передаётся везде без всяких условий.  Если когда-нибудь появится
+# ttk-виджет с заливкой, то условие нужно будет ставить ему, а не цвету текста:
+# раньше одна проверка охраняла оба параметра сразу, и macOS терял подсказки
+# цветом без всякой на то причины.
+#
+# Отдельно и специально: РАСКРАСКА СТРОК ТАБЛИЦЫ через tag_configure к этому
+# отношения не имеет - теги Treeview работают и на aqua, поэтому цвета
+# ok/warn/error задаются именно тегами и снимать их нельзя нигде.
 
-    На macOS тема aqua рисует виджеты силами системы и цвета, заданные
-    программой, игнорирует.  Это НЕ ошибка и не повод что-то чинить: подписи
-    в этой программе раскрашены лишь для подсказки, а сам смысл всегда написан
-    словами.  Функция нужна, чтобы не передавать в такой теме заведомо
-    бесполезные параметры.
 
-    Отдельно и специально: РАСКРАСКА СТРОК ТАБЛИЦЫ через tag_configure к этому
-    отношения не имеет - теги Treeview работают и на aqua, поэтому цвета
-    ok/warn/error задаются именно тегами и снимать их нельзя нигде.
+# ---------------- светлое оформление или тёмное ----------------
+
+
+def _luma(widget, color: str) -> float:
+    """Яркость цвета от 0 (чёрный) до 1 (белый).  При любой ошибке - 1.0.
+
+    Единица, а не ноль: не сумев выяснить фон, считать его СВЕТЛЫМ безопаснее.
+    Тёмные буквы на неизвестном фоне читаются в большинстве случаев, светлые
+    на светлом - ни в одном.
     """
     try:
-        return str(ttk.Style(widget).theme_use()) != "aqua"
+        r, g, b = widget.winfo_rgb(color)
     except Exception:
-        return True
+        return 1.0
+    return (0.299 * (r >> 8) + 0.587 * (g >> 8) + 0.114 * (b >> 8)) / 255.0
+
+
+def widget_is_dark(widget) -> bool:
+    """Тёмный ли фон у ОБЫЧНОГО виджета Tk (tk.Text и ему подобные)."""
+    try:
+        return _luma(widget, widget.cget("background")) < 0.5
+    except Exception:                                   # pragma: no cover
+        return False
+
+
+def ttk_style_is_dark(widget, style_name: str) -> bool:
+    """Тёмный ли фон у ttk-виджета данного стиля.
+
+    Спросить сам виджет нельзя: ttk.Treeview на cget("background") отвечает
+    TclError «unknown option "-background"» - проверено на Tk 8.6.15.  Цвет
+    знает только тема, поэтому спрашиваем её.
+
+    Windows отвечает «SystemWindow» (белый) - и вызывающий код выбирает прежний
+    светлый набор цветов, ничего не меняя.  macOS отвечает
+    «systemTextBackgroundColor»: это ДИНАМИЧЕСКИЙ цвет, который система
+    разворачивает в текущее оформление, то есть в тёмный при тёмной теме.
+    Ради этого случая функция и нужна.
+    """
+    try:
+        color = ttk.Style(widget).lookup(style_name, "background")
+    except Exception:                                   # pragma: no cover
+        return False
+    if not color:
+        return False
+    return _luma(widget, color) < 0.5
+
+
+# ---------------- строка меню macOS ----------------
+
+
+def install_macos_menubar(root, app) -> None:
+    """Строка меню и перехват «Завершить» на macOS.  Ничего не делает на других.
+
+    Главное здесь - НЕ меню, а одна строка с tk::mac::Quit, и вот почему.
+    Command+Q на macOS - это не нажатие клавиш, доходящее до окна, а событие
+    Apple Event kAEQuitApplication.  Оно НЕ проходит через WM_DELETE_WINDOW,
+    то есть мимо app.on_close: настройки не сохраняются, а рабочий поток
+    убивают посреди записи .jpg.  Перехватить это можно единственным способом -
+    объявив команду tk::mac::Quit, что здесь и делается.  На Windows и Linux
+    крестик окна и так ведёт в on_close, поэтому там функция выходит сразу и
+    окно остаётся ровно таким, каким было.
+
+    Меню же нужно потому, что macOS всё равно покажет строку меню - своё,
+    безымянное, названное по имени исполняемого файла, и дотянуться до него из
+    Python уже нельзя.  Лучше объявить своё.  Пунктов «Выход», «О программе» и
+    «Настройки» в нём намеренно нет: их macOS размещает сам в меню приложения.
+    """
+    if not IS_MACOS:
+        return
+
+    def about() -> None:
+        try:
+            messagebox.showinfo("Конвертер CR2",
+                                "CR2 в JPEG (без потерь, как снято)\n\n"
+                                "Достаёт из файла CR2 готовый снимок камеры "
+                                "без перекодирования.", parent=root)
+        except Exception:                               # pragma: no cover
+            pass
+
+    try:
+        # tearoff=0 и у самой строки меню: по умолчанию Tk добавляет в меню
+        # пунктирную строку отрыва.  На aqua она игнорируется, но полагаться на
+        # это незачем - лишнего пустого пункта в строке меню быть не должно.
+        menubar = tk.Menu(root, tearoff=0)
+        # Меню с именем "apple" обязано существовать ДО того, как строка меню
+        # впервые назначена окну: иначе Tk подставит собственное меню
+        # приложения, и заменить его потом уже не получится.
+        apple = tk.Menu(menubar, name="apple", tearoff=0)
+        apple.add_command(label="О программе «Конвертер CR2»", command=about)
+        menubar.add_cascade(menu=apple)
+
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="Выбрать папку…", accelerator="Cmd+O",
+                           command=app.choose_dir)
+        m_file.add_command(label="Выбрать файлы…", accelerator="Cmd+Shift+O",
+                           command=app.choose_files)
+        m_file.add_separator()
+        m_file.add_command(label="Показать папку результата",
+                           command=app.open_out_dir)
+        menubar.add_cascade(label="Файл", menu=m_file)
+
+        # Имена "window" и "help" macOS распознаёт и наполняет сама.
+        menubar.add_cascade(label="Окно",
+                            menu=tk.Menu(menubar, name="window", tearoff=0))
+        menubar.add_cascade(label="Справка",
+                            menu=tk.Menu(menubar, name="help", tearoff=0))
+        root["menu"] = menubar
+    except Exception:                                   # pragma: no cover
+        # Меню - украшение.  Не построилось - программа обязана продолжить
+        # запуск, потому что ниже идёт то, ради чего всё и написано.
+        pass
+
+    # accelerator= только РИСУЕТ сочетание клавиш, нажатие оно не обрабатывает.
+    for sequence, action in (("<Command-o>", app.choose_dir),
+                             ("<Command-O>", app.choose_files)):
+        try:
+            root.bind_all(sequence, lambda _e, _a=action: _a())
+        except Exception:                               # pragma: no cover
+            pass
+
+    try:
+        # Ради этой строки написано всё остальное.
+        root.createcommand("tk::mac::Quit", app.on_close)
+    except Exception:                                   # pragma: no cover
+        pass
+    try:
+        # Щелчок по значку в Dock при скрытом окне.
+        root.createcommand("tk::mac::ReopenApplication",
+                           lambda: (root.deiconify(), root.lift()))
+    except Exception:                                   # pragma: no cover
+        pass
+    # tk::mac::ShowPreferences НЕ объявляется намеренно: пункт «Настройки…» в
+    # меню приложения включается самим фактом объявления команды, а окна
+    # настроек в программе нет.  Без объявления пункт остаётся серым, как и
+    # должно быть.
 
 
 SETTINGS_PATH = settings_path()
@@ -556,11 +736,19 @@ def _fatal_bootstrap(header: str, exc: BaseException) -> None:
         # таймаута.  Отдаём ошибку вызывающему коду: у app.py есть свой
         # _fatal(), а тест превращает её в skip.
         raise exc
+    hint = ("Проверьте, что рядом лежат cr2_gui.pyw и cr2_core.py, "
+            "и что Python установлен вместе с компонентом tcl/tk.")
+    if IS_LINUX:
+        # На Linux tcl/tk - ОТДЕЛЬНЫЙ пакет, и его почти никогда нет сразу.
+        # Без конкретных команд сообщение оказывается тупиком: человеку сказали,
+        # чего не хватает, но не сказали, что с этим делать.
+        hint += ("\n\nНа Linux этот компонент ставится отдельно:\n"
+                 "    Debian, Ubuntu:  sudo apt install python3-tk\n"
+                 "    Fedora, RHEL:    sudo dnf install python3-tkinter\n"
+                 "    Arch:            sudo pacman -S tk")
     native_error_dialog(
         "Конвертер CR2",
-        "%s\n\nПодробности записаны в файл:\n%s\n\n"
-        "Проверьте, что рядом лежат cr2_gui.pyw и cr2_core.py, "
-        "и что Python установлен вместе с компонентом tcl/tk." % (text, path))
+        "%s\n\nПодробности записаны в файл:\n%s\n\n%s" % (text, path, hint))
     os._exit(1)
 
 
@@ -1191,7 +1379,16 @@ def job_worker(spec: dict, opts, probe_only: bool,
 SIZE_CHOICES = ("не уменьшать", "1024", "1600", "2048", "2560", "3200", "4096", "6000")
 NO_RESIZE = SIZE_CHOICES[0]
 
-CR2_TYPES = [("Файлы Canon RAW", "*.cr2"), ("Все файлы", "*.*")]
+# Обе записи регистра нужны из-за Linux: диалог Tk отбирает файлы командой
+# glob БЕЗ ключа -nocase (tkfbox.tcl, GlobFiltered), поэтому «*.cr2» там не
+# показывает ни одного IMG_0001.CR2 - то есть ровно те имена, которые пишет
+# камера Canon.  Пользователь видит пустой список и считает программу сломанной.
+# Windows и macOS сверяют расширение без учёта регистра, и для них ничего не
+# меняется.
+#
+# «*», а не «*.*»: под glob «*.*» означает «в имени есть точка», из-за чего файлы
+# вовсе без расширения пропадают.  Любой файл в терминах Tk - это «*».
+CR2_TYPES = [("Файлы Canon RAW", ("*.cr2", "*.CR2")), ("Все файлы", "*")]
 
 
 class App(ttk.Frame):
@@ -1203,9 +1400,6 @@ class App(ttk.Frame):
         master.columnconfigure(0, weight=1)
 
         self.scale = ui_scale(master)
-        # Слушается ли тема цветов у ttk-виджетов (на macOS/aqua - нет).
-        # Считаем один раз: тему выбирает main() до сборки окна.
-        self._colors_ok = theme_honours_widget_colors(master)
         self.q: "queue.Queue" = queue.Queue()
         self.cancel_evt = threading.Event()
         self.thread: threading.Thread | None = None
@@ -1294,15 +1488,19 @@ class App(ttk.Frame):
         return int(round(value * self.scale))
 
     def _fg(self, color: str) -> dict:
-        """Цвет текста для ttk-подписи: {} там, где тема его игнорирует.
+        """Цвет текста для ttk-подписи.  Работает на всех трёх системах.
 
-        Цвет здесь - только подсказка: смысл каждой такой подписи написан
-        словами, поэтому на macOS (тема aqua рисует виджеты сама и цвета не
-        принимает) ничего не теряется, а лишний игнорируемый параметр не
-        передаётся.  К раскраске строк таблицы это не относится: там цвета
-        живут в тегах Treeview и работают на всех системах.
+        Условия здесь нет намеренно.  Тема aqua (macOS) не принимает у
+        ttk-виджета ЗАЛИВКУ, но цвет ТЕКСТА принимает: style map на
+        TLabel -foreground в aquaTheme.tcl отсутствует.  Раньше на macOS цвет
+        текста отбрасывался заодно с заливкой, и подписи-подсказки там теряли
+        различие между «предупреждение» и «пояснение» ни за что.
+
+        Цвет в любом случае только подсказка: смысл каждой такой подписи
+        написан словами, поэтому даже в теме, которая цвет проигнорирует,
+        ничего не теряется.
         """
-        return {"foreground": color} if self._colors_ok else {}
+        return {"foreground": color}
 
     def _build_ui(self) -> None:
         s = self.scale
@@ -1530,14 +1728,29 @@ class App(ttk.Frame):
                              stretch=stretch, minwidth=self._px(60))
         # Цвета строк задаются ТЕГАМИ, а не стилем, и это принципиально:
         # tag_configure у Treeview работает на всех трёх системах, включая
-        # macOS/aqua, тогда как style.configure("Treeview", background=...) там
-        # игнорируется.  Каждый тег ставится отдельно: если какая-то сборка Tk
-        # откажется от одного цвета, остальные должны уцелеть, а окно -
-        # построиться.
-        for _tag, _bg, _fg in (("ok", "#e8f6e8", "#14521f"),
-                               ("warn", "#fff2de", "#8a4b00"),
-                               ("error", "#fde8e8", "#8b0000"),
-                               ("skipped", "#f2f2f2", "#6b6b6b")):
+        # macOS/aqua (там переопределён только режим «строка выделена»), тогда
+        # как style.configure("Treeview", background=...) на aqua игнорируется.
+        #
+        # Наборов два, потому что фон таблицы не всегда белый.  Собранное
+        # приложение разрешает тёмное оформление macOS
+        # (NSRequiresAquaSystemAppearance=False в cr2app.spec), фон становится
+        # почти чёрным - и светлые заливки превращают таблицу в нечитаемую
+        # полосатую кашу, причём сильнее всего страдают строки ОШИБОК, ради
+        # которых в таблицу и смотрят.  На Windows тема отвечает «SystemWindow»,
+        # то есть белым, и берётся первый набор - ровно те цвета, что были.
+        if ttk_style_is_dark(self.tree, "Treeview"):
+            _row_colors = (("ok", "#1d3324", "#8fdca4"),
+                           ("warn", "#3a2f18", "#ffc46b"),
+                           ("error", "#3a1e1e", "#ff8a8a"),
+                           ("skipped", "#2a2a2a", "#9a9a9a"))
+        else:
+            _row_colors = (("ok", "#e8f6e8", "#14521f"),
+                           ("warn", "#fff2de", "#8a4b00"),
+                           ("error", "#fde8e8", "#8b0000"),
+                           ("skipped", "#f2f2f2", "#6b6b6b"))
+        # Каждый тег ставится отдельно: если какая-то сборка Tk откажется от
+        # одного цвета, остальные должны уцелеть, а окно - построиться.
+        for _tag, _bg, _fg in _row_colors:
             try:
                 self.tree.tag_configure(_tag, background=_bg, foreground=_fg)
             except tk.TclError:                      # pragma: no cover
@@ -1591,13 +1804,9 @@ class App(ttk.Frame):
         # белые и читаемые, а строки ОШИБОК — те, ради которых журнал и
         # открывают, — почти не видны.  Поэтому сначала выясняем фактический
         # фон, потом берём пару под него.
-        try:
-            _rgb = self.log_text.winfo_rgb(self.log_text.cget("background"))
-            _luma = (0.299 * (_rgb[0] >> 8) + 0.587 * (_rgb[1] >> 8)
-                     + 0.114 * (_rgb[2] >> 8)) / 255.0
-        except Exception:                                   # pragma: no cover
-            _luma = 1.0                                     # считаем фон светлым
-        _err, _warn = (("#ff6b6b", "#ffb454") if _luma < 0.5
+        # widget_is_dark - общая проверка из раздела «Платформа»: тот же расчёт
+        # яркости теперь обслуживает и журнал, и строки таблицы.
+        _err, _warn = (("#ff6b6b", "#ffb454") if widget_is_dark(self.log_text)
                        else ("#b00000", "#a06000"))
         for _tag, _color in (("err", _err), ("warn", _warn)):
             try:
@@ -1695,6 +1904,12 @@ class App(ttk.Frame):
         paths = filedialog.askopenfilenames(parent=self, title="Выберите файлы CR2",
                                             initialdir=self._initial_dir(),
                                             filetypes=CR2_TYPES)
+        if isinstance(paths, str):
+            # Документировано, что возвращается кортеж, но отдельные сборки Tk
+            # отдают список Tcl одной строкой.  splitlist разбирает его с учётом
+            # пробелов и фигурных скобок в именах; без этой строки цикл ниже
+            # рассыпал бы такую строку на отдельные буквы.
+            paths = self.tk.splitlist(paths)
         if not paths:
             return
         files = [os.path.normpath(p) for p in paths
@@ -2491,7 +2706,11 @@ class App(ttk.Frame):
 def main() -> int:
     enable_dpi_awareness()                 # ОБЯЗАТЕЛЬНО до tk.Tk()
     install_crash_hooks(None)
-    root = tk.Tk()
+    # className задаёт WM_CLASS на X11.  По нему оконный менеджер Linux
+    # сопоставляет окну значок и .desktop-файл и группирует окна в панели задач;
+    # без него окно подписано «Tk» и со своим значком не связывается.  Windows и
+    # macOS этот параметр не используют - там окно остаётся прежним.
+    root = tk.Tk(className=APP_ID)
     install_crash_hooks(root)              # повторно: теперь и для tk-колбэков
     # Заголовок обещает ровно то, что программа делает: достаёт из CR2 готовый
     # JPEG камеры без перекодирования.  Прежний вариант упоминал DPP и наводил
@@ -2499,10 +2718,15 @@ def main() -> int:
     root.title("CR2 в JPEG (без потерь, как снято)")
     apply_ui_theme(root)                   # vista / aqua / clam - по системе
     apply_default_ui_font(root)            # пустая операция на Windows и macOS
-    s = ui_scale(root)
+    honour_linux_scaling(root)             # пустая операция на Windows и macOS
+    s = ui_scale(root)                     # уже с учётом строки выше
     root.geometry("%dx%d" % (int(1020 * s), int(760 * s)))
     root.minsize(int(760 * s), int(560 * s))
     app = App(root)
+    # Строка меню macOS, а главное - перехват Command+Q, который иначе прошёл бы
+    # мимо on_close вместе с несохранёнными настройками.  На Windows и Linux
+    # ничего не делает.
+    install_macos_menubar(root, app)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
     return 0
