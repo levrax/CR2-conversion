@@ -51,11 +51,406 @@ try:
 except Exception:                                   # pragma: no cover
     APP_DIR = Path(os.getcwd())
 
-SETTINGS_PATH = APP_DIR / "cr2_gui_settings.json"
-ERROR_LOG_PATH = APP_DIR / "cr2_gui_error.log"
-
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
+
+
+# --------------------------------------------------------------------------
+# Платформа: ЕДИНСТВЕННОЕ место в программе, которое знает про разницу систем
+# --------------------------------------------------------------------------
+#
+# Правило раздела: каждая функция обязана отработать на любой из трёх систем и
+# НИКОГДА не бросать исключение наружу.  Где возможности нет - функция просто
+# ничего не делает и сообщает об этом возвращаемым значением.  Поэтому ниже по
+# файлу нет ни одного обращения к sys.platform, ctypes.windll, os.startfile и
+# ни одного зашитого имени шрифта: весь разбор системы собран здесь.
+#
+# Поведение на Windows при этом не меняется ни в одной точке: ветка IS_WINDOWS
+# в каждой функции повторяет прежний код дословно.
+# --------------------------------------------------------------------------
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
+# Всё остальное - X11/Wayland: Linux, *BSD.  Ведут себя одинаково.
+IS_LINUX = not IS_WINDOWS and not IS_MACOS
+
+APP_ID = "CR2Converter"               # имя папки настроек вне папки программы
+SETTINGS_NAME = "cr2_gui_settings.json"
+ERROR_LOG_NAME = "cr2_gui_error.log"
+
+ERROR_LOG_PATH = APP_DIR / ERROR_LOG_NAME
+
+
+# ---------------- системное окно с ошибкой (без tkinter) ----------------
+
+
+def _applescript_string(text: str) -> str:
+    """Строковый литерал AppleScript.  Без этого кавычка в пути ломает скрипт."""
+    body = (str(text).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t"))
+    return '"%s"' % body
+
+
+def native_error_dialog(title: str, text: str) -> bool:
+    """Показать системное окно с ошибкой БЕЗ участия tkinter.
+
+    Нужно ровно в одном случае: tkinter не загрузился, значит messagebox
+    недоступен, а окна ещё нет.  Возвращает True, если окно удалось показать.
+    Никогда не бросает исключение: это последний рубеж перед os._exit().
+
+    Windows: user32.MessageBoxW (как было).
+    macOS:   osascript display dialog - есть в любой системе, ставить нечего.
+    Linux:   zenity, затем kdialog, затем xmessage; если нет ничего - False,
+             и вызывающий код остаётся с записью в журнале, что уже не молчание.
+    """
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)
+            return True
+        except Exception:
+            return False
+
+    try:
+        import subprocess
+    except Exception:
+        return False
+
+    if IS_MACOS:
+        script = ("display dialog %s with title %s buttons {\"OK\"} "
+                  "default button 1 with icon stop"
+                  % (_applescript_string(text), _applescript_string(title)))
+        cmds = [["osascript", "-e", script]]
+    else:
+        cmds = [
+            ["zenity", "--error", "--no-wrap", "--title", title, "--text", text],
+            ["kdialog", "--title", title, "--error", text],
+            ["xmessage", "-center", "%s\n\n%s" % (title, text)],
+        ]
+
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=600, check=False)
+            return True
+        except Exception:
+            # Нет такой программы (FileNotFoundError), нет дисплея, таймаут -
+            # пробуем следующую, молча.
+            continue
+    return False
+
+
+# ---------------- DPI / масштаб ----------------
+
+
+def enable_dpi_awareness() -> str:
+    """Лучший доступный режим DPI.  ОБЯЗАТЕЛЬНО вызвать ДО tk.Tk().
+
+    Windows: без этого окно рисует сама система, растягивая картинку 96 DPI, -
+        текст получается мыльным.  Три способа по убыванию качества, потому что
+        первые два появились только в Windows 10 1703 и 8.1 соответственно.
+    macOS:   Retina обслуживает система, окно всегда живёт в логических точках;
+        делать нечего, и попытка что-то настроить была бы вредна.
+    Linux:   масштабом управляет сессия (GDK_SCALE, Xft.dpi, tk scaling);
+        навязывать своё - значит ломать настройку пользователя.
+    """
+    if not IS_WINDOWS:
+        return "n/a"
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return "permonitor_v2"
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return "system"
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+        return "legacy"
+    except Exception:
+        return "none"
+
+
+# ---------------- где лежит файл настроек ----------------
+
+
+def _dir_is_writable(path: Path) -> bool:
+    """Проверка БЕЗ побочных эффектов: ничего не создаём и не открываем.
+
+    Пробная запись файла здесь недопустима - ровно из-за такой «проверки»
+    раньше при каждом запуске появлялся пустой журнал ошибок.
+    """
+    try:
+        return path.is_dir() and os.access(str(path), os.W_OK)
+    except Exception:
+        return False
+
+
+def _inside_macos_app_bundle(path: Path) -> bool:
+    """Программа запущена изнутри .app?  Тогда писать внутрь нельзя.
+
+    Содержимое бандла подписано; запись в него ломает подпись, а в /Applications
+    её вдобавок обычно и не разрешат.
+    """
+    if not IS_MACOS:
+        return False
+    try:
+        return any(part.endswith(".app") for part in path.parts)
+    except Exception:
+        return False
+
+
+def user_config_dir() -> Path:
+    """Стандартная папка настроек текущей системы.  Каталог НЕ создаётся."""
+    try:
+        home = Path.home()
+    except Exception:                                   # pragma: no cover
+        home = Path(os.path.expanduser("~"))
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or ""
+        return (Path(base) if base else home / "AppData" / "Roaming") / APP_ID
+    if IS_MACOS:
+        return home / "Library" / "Application Support" / APP_ID
+    base = os.environ.get("XDG_CONFIG_HOME") or ""
+    return (Path(base) if base else home / ".config") / APP_ID.lower()
+
+
+def settings_path() -> Path:
+    """Куда класть cr2_gui_settings.json.
+
+    Windows: рядом с программой - ровно как было.  Программа переносимая: папку
+        можно скопировать на флешку вместе с настройками.
+    macOS/Linux: тоже рядом с программой, пока туда можно писать - переносимость
+        важнее единообразия.  А вот если программа лежит внутри .app или в
+        системном каталоге (/Applications, /usr/local/bin), запись туда либо
+        запрещена, либо ломает подпись бандла - тогда берём стандартную папку
+        настроек системы.
+    """
+    if IS_WINDOWS:
+        return APP_DIR / SETTINGS_NAME
+    if not _inside_macos_app_bundle(APP_DIR) and _dir_is_writable(APP_DIR):
+        return APP_DIR / SETTINGS_NAME
+    return user_config_dir() / SETTINGS_NAME
+
+
+def legacy_text_encodings() -> tuple:
+    """Кодировки-кандидаты для файла настроек, который оказался не UTF-8.
+
+    Первой всегда идёт кодировка системы, затем историческая однобайтовая
+    кириллица.  На Windows это прежняя пара (кодировка системы, cp1251) -
+    поведение не изменилось.  На macOS добавлена mac_cyrillic (кириллица
+    классического Mac OS), на Linux список тот же cp1251: не-UTF-8 файл
+    настроек там может появиться единственным способом - его принесли с Windows.
+    """
+    found = []
+    try:
+        import locale
+        pref = locale.getpreferredencoding(False)
+        if pref:
+            found.append(pref)
+    except Exception:
+        pass
+    if IS_MACOS:
+        found.append("mac_cyrillic")
+    found.append("cp1251")
+    seen = set()
+    result = []
+    for enc in found:
+        key = enc.lower().replace("-", "_")
+        if key not in seen:
+            seen.add(key)
+            result.append(enc)
+    return tuple(result)
+
+
+# ---------------- «показать папку в проводнике» ----------------
+
+
+def reveal_in_file_manager(target) -> None:
+    """Открыть папку в файловом менеджере системы.
+
+    Бросает OSError, если открыть не удалось - вызывающий код показывает это
+    пользователю.  Другие исключения наружу не выходят.
+    """
+    path = os.path.normpath(str(target))
+    if IS_WINDOWS:
+        starter = getattr(os, "startfile", None)
+        if starter is None:                             # pragma: no cover
+            raise OSError("os.startfile недоступен")
+        starter(path)          # корректно работает с кириллицей
+        return
+
+    try:
+        import subprocess
+    except Exception as exc:                            # pragma: no cover
+        raise OSError("subprocess недоступен: %s" % exc)
+
+    if IS_MACOS:
+        commands = [["open", path]]
+    else:
+        # xdg-open - стандарт freedesktop; gio есть везде, где есть GLib;
+        # дальше конкретные менеджеры на случай голого окружения.
+        commands = [["xdg-open", path], ["gio", "open", path],
+                    ["nautilus", path], ["dolphin", path],
+                    ["thunar", path], ["pcmanfm", path], ["nemo", path]]
+
+    last = None
+    for cmd in commands:
+        try:
+            # Popen, а не run: файловый менеджер живёт своей жизнью, ждать его
+            # нельзя - иначе интерфейс замрёт до закрытия окна проводника.
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            return
+        except OSError as exc:      # нет такой программы - пробуем следующую
+            last = exc
+        except Exception as exc:                        # pragma: no cover
+            last = exc
+    raise OSError("не нашлось программы для показа папки (%s)" % (last,))
+
+
+# ---------------- шрифты ----------------
+
+
+def _available_font_families(widget=None) -> frozenset:
+    """Список установленных семейств шрифтов.  Пустой, если Tk ещё не готов."""
+    try:
+        from tkinter import font as tkfont
+        names = tkfont.families(widget) if widget is not None else tkfont.families()
+        return frozenset(names)
+    except Exception:
+        return frozenset()
+
+
+def _first_installed(widget, candidates) -> str:
+    families = _available_font_families(widget)
+    if not families:
+        return ""
+    lowered = {name.lower(): name for name in families}
+    for want in candidates:
+        got = lowered.get(want.lower())
+        if got:
+            return got
+    return ""
+
+
+def monospace_font(widget=None):
+    """Моноширинный шрифт для журнала.
+
+    Consolas есть только на Windows; Menlo - только на macOS; DejaVu Sans Mono -
+    типовой в дистрибутивах Linux.  Если ни одного из списка нет, возвращаем
+    именованный шрифт Tk «TkFixedFont»: он существует всегда и по определению
+    моноширинный.
+    """
+    if IS_WINDOWS:
+        return ("Consolas", 9)
+    if IS_MACOS:
+        candidates = ("SF Mono", "Menlo", "Monaco", "Courier New")
+        size = 11
+    else:
+        candidates = ("DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono",
+                      "Ubuntu Mono", "FreeMono", "Courier New")
+        size = 9
+    family = _first_installed(widget, candidates)
+    return (family, size) if family else "TkFixedFont"
+
+
+def apply_default_ui_font(root=None) -> str:
+    """Привести шрифт интерфейса в порядок там, где система этого не делает.
+
+    Windows и macOS: НИЧЕГО не трогаем.  Tk и так берёт Segoe UI и системный
+    шрифт macOS соответственно, и вмешательство только испортило бы вид.
+    X11: у Tk остаётся запасной вариант вроде растрового «Helvetica», если в
+    системе нет ни одного из привычных семейств - в этом (и только в этом)
+    случае подставляем нормальный масштабируемый шрифт.
+
+    Возвращает итоговое семейство или "" - для журнала, не для логики.
+    """
+    if IS_WINDOWS or IS_MACOS:
+        return ""
+    try:
+        from tkinter import font as tkfont
+        base = tkfont.nametofont("TkDefaultFont", root)
+        current = str(base.actual("family") or "")
+        if current.lower() not in ("helvetica", "fixed", "clean", "courier", ""):
+            return current
+        family = _first_installed(root, ("DejaVu Sans", "Liberation Sans",
+                                         "Noto Sans", "Cantarell", "Arial"))
+        if not family:
+            return current
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                     "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont"):
+            try:
+                tkfont.nametofont(name, root).configure(family=family)
+            except Exception:
+                continue
+        return family
+    except Exception:
+        return ""
+
+
+# ---------------- тема ttk ----------------
+
+
+def apply_ui_theme(root=None) -> str:
+    """Выбрать тему ttk, родную для системы.  Возвращает имя выбранной темы.
+
+    Windows: vista - как было.
+    macOS:   aqua.  Раньше сюда доходила ветка «нет vista -> clam», то есть на
+             Mac программа сама отключала родную тему и выглядела чужой.
+    Linux:   clam: единственная из встроенных, у которой прилично выглядят
+             Treeview и Combobox; default/alt - запасные.
+    """
+    try:
+        style = ttk.Style(root)
+        names = style.theme_names()
+    except Exception:
+        return ""
+    if IS_WINDOWS:
+        preferred = ("vista", "clam")
+    elif IS_MACOS:
+        preferred = ("aqua", "clam")
+    else:
+        preferred = ("clam", "alt", "default")
+    for name in preferred:
+        if name in names:
+            try:
+                style.theme_use(name)
+                break
+            except Exception:
+                continue
+    try:
+        return str(style.theme_use())
+    except Exception:
+        return ""
+
+
+def theme_honours_widget_colors(widget=None) -> bool:
+    """Слушается ли тема параметров -foreground/-background у ttk-виджетов.
+
+    На macOS тема aqua рисует виджеты силами системы и цвета, заданные
+    программой, игнорирует.  Это НЕ ошибка и не повод что-то чинить: подписи
+    в этой программе раскрашены лишь для подсказки, а сам смысл всегда написан
+    словами.  Функция нужна, чтобы не передавать в такой теме заведомо
+    бесполезные параметры.
+
+    Отдельно и специально: РАСКРАСКА СТРОК ТАБЛИЦЫ через tag_configure к этому
+    отношения не имеет - теги Treeview работают и на aqua, поэтому цвета
+    ok/warn/error задаются именно тегами и снимать их нельзя нигде.
+    """
+    try:
+        return str(ttk.Style(widget).theme_use()) != "aqua"
+    except Exception:
+        return True
+
+
+def fg(color: str, widget=None) -> dict:
+    """Параметры цвета текста для ttk-виджета: {} там, где тема их игнорирует."""
+    return {"foreground": color} if theme_honours_widget_colors(widget) else {}
+
+
+SETTINGS_PATH = settings_path()
 
 POLL_MS = 60           # период опроса очереди (50-100 мс)
 MAX_DRAIN = 200        # не более стольких сообщений за один тик
@@ -83,7 +478,7 @@ def _error_log_path() -> Path:
 def _fallback_log_path() -> Path:
     """Куда писать, если рядом со скриптом нельзя (только чтение, флешка)."""
     import tempfile
-    return Path(tempfile.gettempdir()) / "cr2_gui_error.log"
+    return Path(tempfile.gettempdir()) / ERROR_LOG_NAME
 
 
 def record_error(header: str, text: str) -> Path:
@@ -121,22 +516,18 @@ def _fatal_bootstrap(header: str, exc: BaseException) -> None:
     """Сообщить об ошибке ЗАГРУЗКИ модуля и завершить процесс.
 
     До этой точки нет ни sys.excepthook, ни окна, ни даже tkinter — поэтому
-    messagebox использовать нельзя, только ctypes MessageBoxW. Раньше такая
-    ошибка (нет tcl/tk, скопирован один файл из двух) убивала pythonw.exe
-    вообще без следов: ни окна, ни строки в журнале, а .bat рапортовал успех.
+    messagebox использовать нельзя, только системное окно (native_error_dialog).
+    Раньше такая ошибка (нет tcl/tk, скопирован один файл из двух) убивала
+    pythonw.exe вообще без следов: ни окна, ни строки в журнале, а .bat
+    рапортовал успех.
     """
     text = "%s: %s: %s" % (header, type(exc).__name__, exc)
     path = record_error("bootstrap", text + "\n" + traceback.format_exc())
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.user32.MessageBoxW(
-                None,
-                "%s\n\nПодробности записаны в файл:\n%s\n\n"
-                "Проверьте, что рядом лежат cr2_gui.pyw и cr2_core.py, "
-                "и что Python установлен вместе с компонентом tcl/tk." % (text, path),
-                "Конвертер CR2", 0x10)
-        except Exception:
-            pass
+    native_error_dialog(
+        "Конвертер CR2",
+        "%s\n\nПодробности записаны в файл:\n%s\n\n"
+        "Проверьте, что рядом лежат cr2_gui.pyw и cr2_core.py, "
+        "и что Python установлен вместе с компонентом tcl/tk." % (text, path))
     os._exit(1)
 
 
@@ -203,29 +594,9 @@ def install_crash_hooks(root: tk.Misc | None = None) -> None:
 
 
 # --------------------------------------------------------------------------
-# DPI: обязательно ДО создания Tk(), иначе окно будет растянутым и мыльным
+# DPI: enable_dpi_awareness() живёт в разделе «Платформа» выше и вызывается
+# из main() ДО создания Tk(), иначе окно будет растянутым и мыльным.
 # --------------------------------------------------------------------------
-
-
-def enable_dpi_awareness() -> str:
-    """Лучший доступный режим DPI. На не-Windows - пустая операция."""
-    if sys.platform != "win32":
-        return "n/a"
-    try:
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        return "permonitor_v2"
-    except Exception:
-        pass
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        return "system"
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-        return "legacy"
-    except Exception:
-        return "none"
 
 
 def ui_scale(widget: tk.Misc) -> float:
@@ -269,8 +640,7 @@ def _read_settings_text() -> str:
     try:
         return blob.decode("utf-8")
     except UnicodeDecodeError:
-        import locale
-        for enc in (locale.getpreferredencoding(False), "cp1251"):
+        for enc in legacy_text_encodings():
             try:
                 return blob.decode(enc)
             except (UnicodeDecodeError, LookupError):
@@ -324,6 +694,11 @@ def save_settings(data: dict) -> None:
     """Запись через временный файл: обрыв не оставляет обрезанный JSON."""
     tmp = SETTINGS_PATH.with_name(SETTINGS_PATH.name + ".%d.tmp" % os.getpid())
     try:
+        # Папка программы уже существует (мы из неё запустились), а вот
+        # ~/Library/Application Support/CR2Converter или ~/.config/cr2converter
+        # может ещё не существовать - создаём, но только при первой ЗАПИСИ,
+        # чтобы простой запуск программы не оставлял следов в системе.
+        SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
@@ -1074,10 +1449,20 @@ class App(ttk.Frame):
                               command=lambda c=cid: self._sort_by(c))
             self.tree.column(cid, width=self._px(width), anchor=anchor,
                              stretch=stretch, minwidth=self._px(60))
-        self.tree.tag_configure("ok", background="#e8f6e8", foreground="#14521f")
-        self.tree.tag_configure("warn", background="#fff2de", foreground="#8a4b00")
-        self.tree.tag_configure("error", background="#fde8e8", foreground="#8b0000")
-        self.tree.tag_configure("skipped", background="#f2f2f2", foreground="#6b6b6b")
+        # Цвета строк задаются ТЕГАМИ, а не стилем, и это принципиально:
+        # tag_configure у Treeview работает на всех трёх системах, включая
+        # macOS/aqua, тогда как style.configure("Treeview", background=...) там
+        # игнорируется.  Каждый тег ставится отдельно: если какая-то сборка Tk
+        # откажется от одного цвета, остальные должны уцелеть, а окно -
+        # построиться.
+        for _tag, _bg, _fg in (("ok", "#e8f6e8", "#14521f"),
+                               ("warn", "#fff2de", "#8a4b00"),
+                               ("error", "#fde8e8", "#8b0000"),
+                               ("skipped", "#f2f2f2", "#6b6b6b")):
+            try:
+                self.tree.tag_configure(_tag, background=_bg, foreground=_fg)
+            except tk.TclError:                      # pragma: no cover
+                pass
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<Double-1>", self._on_row_activate)
         self.tree.bind("<Return>", self._on_row_activate)
@@ -1114,8 +1499,11 @@ class App(ttk.Frame):
         self.log_frame.grid(row=row, column=0, sticky="nsew", pady=(self._px(4), 0))
         self.log_frame.rowconfigure(0, weight=1)
         self.log_frame.columnconfigure(0, weight=1)
+        # Шрифт подбирается по системе: Consolas есть только на Windows, и
+        # зашитое имя на Mac/Linux дало бы молчаливую подмену на пропорциональный
+        # шрифт - колонки журнала перестали бы совпадать.
         self.log_text = tk.Text(self.log_frame, height=8, wrap="none",
-                                state="disabled", font=("Consolas", 9))
+                                state="disabled", font=monospace_font(self))
         self.log_text.grid(row=0, column=0, sticky="nsew")
         self.log_text.tag_configure("err", foreground="#b00000")
         self.log_text.tag_configure("warn", foreground="#a06000")
@@ -1888,8 +2276,8 @@ class App(ttk.Frame):
                                 parent=self)
             return
         try:
-            os.startfile(os.path.normpath(target))   # корректно работает с кириллицей
-        except AttributeError:
+            reveal_in_file_manager(target)
+        except AttributeError:                       # pragma: no cover
             messagebox.showinfo("Папка результата", target, parent=self)
         except OSError as exc:
             messagebox.showerror("Не удалось открыть папку",
@@ -2008,14 +2396,8 @@ def main() -> int:
     # JPEG камеры без перекодирования.  Прежний вариант упоминал DPP и наводил
     # на мысль, что правки DPP как-то учитываются.
     root.title("CR2 в JPEG (без потерь, как снято)")
-    try:
-        style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        elif "clam" in style.theme_names():
-            style.theme_use("clam")
-    except Exception:
-        pass
+    apply_ui_theme(root)                   # vista / aqua / clam - по системе
+    apply_default_ui_font(root)            # пустая операция на Windows и macOS
     s = ui_scale(root)
     root.geometry("%dx%d" % (int(1020 * s), int(760 * s)))
     root.minsize(int(760 * s), int(560 * s))
