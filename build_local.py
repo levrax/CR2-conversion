@@ -119,7 +119,8 @@ def preflight() -> int:
     say("Платформа   : %s" % sys.platform)
     say("Папка       : %s" % ROOT)
 
-    for name in ("app.py", "cr2app.spec", "cr2_gui.pyw", "cr2_core.py"):
+    for name in ("app.py", "cr2app.spec", "cr2_gui.pyw", "cr2_core.py",
+                 "cr2_convert.py"):          # cr2_convert.py — вход для CLI-exe
         if not (ROOT / name).is_file():
             say("НЕТ ФАЙЛА   : %s" % name)
             problems += 1
