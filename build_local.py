@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,10 +34,16 @@ def _app_name() -> str:
     и скрипт начнёт искать в dist папку, которой нет, сообщая о провале удачной
     сборки.  Поэтому единственный источник истины — APP_NAME в cr2app.spec.
     """
+    # Якорь и кавычки в шаблоне обязательны: startswith("APP_NAME") ловил бы и
+    # строку APP_NAME_CLI, а она в спеке задана через подстановку
+    # ("%s CLI" % APP_NAME) — скрипт искал бы в dist папку с «%s CLI» в имени.
+    # Сейчас APP_NAME стоит в файле раньше, но порядок строк — не гарантия.
+    pattern = re.compile(r'''^APP_NAME\s*=\s*["'](.+?)["']\s*$''')
     try:
         for line in SPEC.read_text(encoding="utf-8").splitlines():
-            if line.startswith("APP_NAME"):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
+            found = pattern.match(line)
+            if found:
+                return found.group(1)
     except Exception:
         pass
     return "CR2 Converter"
