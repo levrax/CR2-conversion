@@ -196,6 +196,9 @@ python -m pip install rawpy Pillow
 | `cr2_core.py` | ядро: разбор CR2, поиск превью, сборка EXIF, запись JPEG |
 | `cr2_convert.py` | команда `python cr2_convert.py …` |
 | `cr2_gui.pyw` | окно с кнопками (tkinter) |
+| `app.py` | точка входа для собранного приложения |
+| `cr2app.spec` | сценарий сборки PyInstaller |
+| `requirements.txt` | необязательные зависимости (Pillow, rawpy, numpy) |
 | `Конвертер CR2.bat` | запуск окна двойным щелчком |
 | `Перетащи сюда CR2.bat` | цель для перетаскивания папок и файлов |
 | `Перетащи сюда CR2.js` | то же, но не теряет пути с `&` и `^` |
