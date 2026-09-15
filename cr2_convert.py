@@ -203,6 +203,7 @@ try:
         find_cr2,
         has_pillow,
         has_rawpy,
+        input_key,
         probe,
     )
 except ImportError as _exc:  # pragma: no cover - зависит от раскладки файлов
@@ -513,10 +514,14 @@ def collect_inputs(raw: Sequence[str], recursive: bool,
             if complain:
                 problems.append("не файл CR2, пропущен: %s" % path)
             return
-        try:
-            key = os.path.normcase(os.path.abspath(str(path)))
-        except (OSError, ValueError):
-            key = os.path.normcase(str(path))
+        # Ключ «тот же самый файл?» — не os.path.normcase: на POSIX это пустая
+        # функция, а стандартный том macOS сам по себе регистронезависим, и
+        # один файл, названный в командной строке дважды в разном регистре,
+        # конвертировался бы дважды.  ВАЖНО: здесь, в отличие от назначения
+        # (_dst_key), безопасная сторона ПРОТИВОПОЛОЖНА — лишнее склеивание
+        # молча ВЫБРОСИЛО бы исходный файл, поэтому при неудачной проверке
+        # тома считаем его регистрозависимым.
+        key = input_key(path)
         if key in seen:
             return
         seen.add(key)

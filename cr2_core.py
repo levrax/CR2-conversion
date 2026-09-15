@@ -75,8 +75,10 @@ import os
 import re
 import secrets
 import struct
+import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +87,7 @@ from typing import Any, Callable, Iterable, Sequence
 __all__ = [
     "CR2_EXTS",
     "plan_destinations",
+    "input_key",
     "validate_suffix",
     "Preview",
     "Cr2Info",
@@ -1297,7 +1300,10 @@ def _is_hidden(entry: os.DirEntry[str]) -> bool:
     name = entry.name
     if name.startswith("."):
         return True
-    if name in ("$RECYCLE.BIN", "System Volume Information"):
+    # __MACOSX holds nothing but AppleDouble twins; it is what Windows gets
+    # after unpacking a Mac-made zip, and it does not start with a dot, so it
+    # used to be walked in full.
+    if name in ("$RECYCLE.BIN", "System Volume Information", "__MACOSX"):
         return True
     try:
         attrs = entry.stat(follow_symlinks=False).st_file_attributes  # type: ignore[attr-defined]
@@ -1390,6 +1396,18 @@ def find_cr2(root: str | Path, recursive: bool = True, *,
                             if recursive and not _is_hidden(entry):
                                 stack.append(Path(entry.path))
                         elif entry.is_file(follow_symlinks=False):
+                            # Dot-names are skipped for FILES too, not just for
+                            # directories.  macOS drops an AppleDouble twin
+                            # `._IMG_0001.CR2` next to every file on a volume
+                            # that cannot hold xattrs natively - that is every
+                            # camera SD card (exFAT/FAT32), every USB stick and
+                            # every SMB share, and Windows sees the same names
+                            # after unpacking a Mac-made zip.  splitext() reads
+                            # them as '.CR2', so a folder of 155 photos used to
+                            # produce 310 rows, 155 of them red with "not a
+                            # TIFF/CR2" - for files Finder does not even show.
+                            if entry.name.startswith("."):
+                                continue
                             if os.path.splitext(entry.name)[1].lower() in CR2_EXTS:
                                 out.append(Path(entry.path))
                     except OSError as exc:
@@ -1833,12 +1851,118 @@ def _dst_path(src: Path, opts: ConvertOptions) -> Path:
     return dst
 
 
+#: True on Windows.  A module constant, not an inline `os.name == "nt"`, so the
+#: POSIX branches below can be exercised by the test suite on any machine
+#: without monkeypatching the os module itself out from under pathlib.
+_ON_NT = (os.name == "nt")
+
+_case_fold_cache: dict[str, bool] = {}
+_case_fold_guard = threading.Lock()
+
+
+def _swapcase_probe(folder: str) -> str | None:
+    """`folder` with the case of its deepest lettered component flipped.
+
+    None when no component carries a letter, in which case the caller cannot
+    probe this way.
+    """
+    head, tail = os.path.split(folder)
+    for _ in range(4):                       # walk up a few levels, then give up
+        if any(ch.isalpha() for ch in tail):
+            return os.path.join(head, tail.swapcase())
+        if not head or head == folder:
+            return None
+        folder = head
+        head, tail = os.path.split(head)
+    return None
+
+
+def _fs_folds_case(folder: Path, *, default: bool) -> bool:
+    """True when `folder`'s volume treats A.jpg and a.jpg as ONE file.
+
+    Read-only probe: stat the folder and the same path with the case of its
+    deepest lettered component flipped.  Same inode on the same device means
+    the volume folds case.  Nothing is ever created or written - the user's
+    photo folders are only ever read here.
+
+    `default` is what to assume when the probe cannot run (folder missing, no
+    letters in the path, stat refused); callers pick the side that is safe for
+    THEIR use, see _dst_key() and cr2_convert.collect_inputs().
+    """
+    if _ON_NT:
+        return True                          # normcase already folds
+    key = str(folder)
+    with _case_fold_guard:
+        hit = _case_fold_cache.get(key)
+    if hit is not None:
+        return hit
+
+    result = default
+    probe = _swapcase_probe(key)
+    if probe is not None and probe != key:
+        try:
+            here = os.stat(key)
+        except OSError:
+            here = None
+        if here is not None:
+            try:
+                there = os.stat(probe)
+            except OSError:
+                # The flipped spelling does not resolve: case matters here.
+                result = False
+            else:
+                result = (here.st_ino == there.st_ino
+                          and here.st_dev == there.st_dev)
+
+    with _case_fold_guard:
+        _case_fold_cache[key] = result
+    return result
+
+
 def _dst_key(dst: Path) -> str:
-    """Canonical key for destination comparison (NTFS is case-insensitive)."""
+    """Canonical key for destination comparison.
+
+    normcase folds case on Windows and is a NO-OP on POSIX - but the DEFAULT
+    macOS volume (APFS, and HFS+ before it) is itself case-insensitive AND
+    normalisation-insensitive.  With a plain normcase, IMG_0042.jpg and
+    img_0042.jpg looked like two destinations, so plan_destinations() skipped
+    its de-duplication and _DestLock handed the two writers DIFFERENT locks:
+    two photos were planned onto one physical file, one was silently lost, and
+    both rows were still reported green.
+
+    The safe side for a DESTINATION is to over-merge: a spurious rename costs a
+    filename, a missed collision costs a photo.  Hence default=True below, and
+    hence the unconditional NFC on POSIX.
+    """
     try:
-        return os.path.normcase(os.path.abspath(str(dst)))
+        text = os.path.abspath(str(dst))
     except (OSError, ValueError):
-        return os.path.normcase(str(dst))
+        text = str(dst)
+    if _ON_NT:
+        return os.path.normcase(text)
+    text = unicodedata.normalize("NFC", text)
+    if _fs_folds_case(Path(text).parent, default=True):
+        return text.casefold()
+    return text
+
+
+def input_key(src: str | Path) -> str:
+    """Canonical key for "have we already got this SOURCE file?".
+
+    Same problem as _dst_key(), OPPOSITE safe side.  Over-merging two inputs
+    silently DROPS a photo from the job, so when the volume cannot be probed we
+    assume it is case-sensitive and keep both spellings.
+    """
+    try:
+        text = os.path.abspath(str(src))
+    except (OSError, ValueError):
+        text = str(src)
+    if _ON_NT:
+        return os.path.normcase(text)
+    text = unicodedata.normalize("NFC", text)
+    if _fs_folds_case(Path(text).parent, default=False):
+        return text.casefold()
+    return text
 
 
 def plan_destinations(paths: Iterable[str | Path],
@@ -1969,10 +2093,28 @@ def _tmp_path(dst: Path) -> Path:
     """
     tag = ".%s.tmp" % secrets.token_hex(4)          # fixed 13 characters
     ext = dst.suffix or ""                          # '.jpg' for every real dst
-    keep = 255 - len(ext) - len(tag)                # NTFS component limit
-    if len(str(dst)) + len(tag) > 250:              # near MAX_PATH: do not grow
-        keep = min(keep, len(dst.name) - len(ext) - len(tag))
-    return dst.with_name(dst.stem[:max(1, keep)] + ext + tag)
+    stem = dst.stem
+    if _ON_NT:
+        keep = 255 - len(ext) - len(tag)            # NTFS: UTF-16 units
+        if len(str(dst)) + len(tag) > 250:          # near MAX_PATH: do not grow
+            keep = min(keep, len(dst.name) - len(ext) - len(tag))
+        stem = stem[:max(1, keep)]
+    else:
+        # APFS/HFS+/ext4 count a component in BYTES, not characters.  Budgeting
+        # 255 characters doubled the real allowance for Cyrillic, so a 120-125
+        # character destination the filesystem accepts produced a temp name it
+        # refuses, and the file failed with ENAMETOOLONG ("File name too long")
+        # although writing dst directly would have worked.  The MAX_PATH clause
+        # above stays Windows-only: PATH_MAX is 1024 here, and applying it would
+        # only truncate ordinary deep paths (iCloud Drive, nested shoot folders)
+        # for no reason.
+        enc = sys.getfilesystemencoding() or "utf-8"
+        budget = 255 - len((ext + tag).encode(enc, "surrogateescape"))
+        # Trim whole CHARACTERS, never bytes: cutting mid-sequence would corrupt
+        # the name and break the round trip through the filesystem encoding.
+        while len(stem) > 1 and len(stem.encode(enc, "surrogateescape")) > budget:
+            stem = stem[:-1]
+    return dst.with_name(stem + ext + tag)
 
 
 def sweep_stale_tmp(dirs: Iterable[Path], max_age: float = 3600.0) -> int:

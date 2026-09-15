@@ -11,6 +11,7 @@ GUI собирается под Tk() только если дисплей дос
 """
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import io
 import os
@@ -32,7 +33,18 @@ def load_gui():
 
     Регистрация в sys.modules обязательна: без неё @dataclass внутри модуля
     падает с AttributeError, потому что dataclasses ищет sys.modules[__module__].
+
+    Проверка tkinter и cr2_core идёт ДО exec_module и превращает их отсутствие
+    в skip: cr2_gui на уровне модуля импортирует оба и на неудаче зовёт
+    _fatal_bootstrap.  Тот больше не делает os._exit(1) из импортированного
+    модуля, но пробрасывать сюда голое исключение всё равно незачем - на
+    машине без tcl/tk эти тесты просто нечего запускать.
     """
+    for name in ("tkinter", "cr2_core"):
+        try:
+            importlib.import_module(name)
+        except BaseException as exc:
+            raise unittest.SkipTest("%s недоступен: %s" % (name, exc))
     spec = importlib.util.spec_from_file_location("cr2_gui", HERE / "cr2_gui.pyw")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cr2_gui"] = mod
@@ -135,12 +147,13 @@ class TestGuiSmoke(unittest.TestCase):
         self.assertNotIn("правки dpp", title)
 
     def test_window_builds_and_closes(self):
-        gui = load_gui()
+        # Проба дисплея идёт ДО load_gui(): сборка окна без него бессмысленна.
         try:
             import tkinter as tk
             root = tk.Tk()
         except Exception as exc:                      # нет дисплея / нет tcl-tk
             self.skipTest(f"Tk недоступен: {exc}")
+        gui = load_gui()
         try:
             root.withdraw()
             app = gui.App(root) if hasattr(gui, "App") else None

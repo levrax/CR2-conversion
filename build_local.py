@@ -142,6 +142,9 @@ def preflight() -> int:
 
     # Pillow, rawpy и numpy для запуска из исходников необязательны, но в
     # дистрибутиве их доустановить уже нельзя: собираем — значит нужны все.
+    # Поэтому это ПРОБЛЕМА, а не заметка: раньше скрипт печатал «в сборке
+    # пропадёт режим …», тут же сообщал «Проверка пройдена» и возвращал 0,
+    # то есть спокойно выпускал дистрибутив с половиной возможностей.
     for mod, why in (("PIL", "поворот и уменьшение"),
                      ("numpy", "нужен rawpy"),
                      ("rawpy", "проявка RAW без встроенного JPEG")):
@@ -151,8 +154,52 @@ def preflight() -> int:
         except ImportError:
             say("%-12s: НЕТ — в сборке пропадёт режим «%s». "
                 "python -m pip install -r requirements.txt" % (mod, why))
+            problems += 1
 
     return problems
+
+
+def check_clean_env(strict: bool) -> int:
+    """Изолировано ли окружение сборки.
+
+    Сборка вне venv утягивает в бандл всё, что лежит в глобальном
+    site-packages (pywin32, yaml, pyreadline3 — программа не импортирует ни
+    одного из них), и результат перестаёт побайтово соответствовать тому, что
+    собирает CI.  Список EXCLUDES в спеке этот мусор не догоняет: он ведётся
+    руками и уже отстал.
+
+    Для СЕБЯ собирать так можно: лишние мегабайты ничего не ломают.  Поэтому по
+    умолчанию это громкое предупреждение, а ошибкой становится только под
+    --strict-env, который стоит включать для сборок «на раздачу».
+    """
+    dirty = ""
+    if sys.prefix == sys.base_prefix:
+        dirty = "сборка идёт НЕ в виртуальном окружении"
+    else:
+        try:
+            text = (Path(sys.prefix) / "pyvenv.cfg").read_text(
+                encoding="utf-8", errors="replace").lower()
+        except OSError:
+            text = ""
+        if "include-system-site-packages = true" in text:
+            dirty = "venv создан с --system-site-packages, изоляции нет"
+
+    say("venv        : %s" % ("НЕТ" if dirty else "да"))
+    if not dirty:
+        return 0
+
+    say("              %s." % dirty)
+    say("              В бандл попадёт лишнее из глобального site-packages, и")
+    say("              он перестанет совпадать с тем, что собирает CI.")
+    say("              python -m venv .venv")
+    say("              %s" % (".venv\\Scripts\\activate" if IS_WIN
+                              else "source .venv/bin/activate"))
+    say("              python -m pip install -r requirements.txt pyinstaller")
+    if strict:
+        say("              --strict-env: считаем это ошибкой.")
+        return 1
+    say("              (не ошибка: для сборки «на раздачу» добавьте --strict-env)")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -176,6 +223,42 @@ def build(clean: bool, log_level: str) -> int:
     say("-" * 70)
     say("PyInstaller завершился с кодом %d за %.0f с" % (rc, took))
     return rc
+
+
+def check_macos_plist(app: Path) -> int:
+    """Info.plist собранного .app: 0 — годен, 1 — бандл нельзя раздавать.
+
+    Проверка существует потому, что «сборка прошла успешно» тут ничего не
+    доказывает.  LSBackgroundOnly=True делает .app фоновым агентом: ни значка
+    в Dock, ни строки меню, окно Tk нельзя вынести на передний план — с точки
+    зрения пользователя приложение по двойному щелчку просто ничего не делает,
+    и в журнале при этом пусто, потому что процесс стартовал нормально.
+    Значение туда попадает само, от console=True у консольного exe в том же
+    COLLECT, так что ловить это нужно именно постфактум, в файле.
+    """
+    import plistlib
+
+    plist = app / "Contents" / "Info.plist"
+    try:
+        with open(plist, "rb") as fh:
+            data = plistlib.load(fh)
+    except Exception as exc:
+        say("Info.plist  : не прочитан (%s)" % exc)
+        return 1
+
+    bad = 0
+    if data.get("LSBackgroundOnly"):
+        say("Info.plist  : LSBackgroundOnly=true — бандл запустится ФОНОВЫМ")
+        say("              агентом: ни значка в Dock, ни меню, окно не поднять.")
+        bad = 1
+    if not data.get("NSHighResolutionCapable"):
+        say("Info.plist  : нет NSHighResolutionCapable — окно будет мыльным")
+        bad = 1
+    say("Версия бандла: %s (CFBundleShortVersionString)"
+        % data.get("CFBundleShortVersionString"))
+    if not bad:
+        say("Info.plist  : в порядке")
+    return bad
 
 
 def report() -> int:
@@ -221,6 +304,11 @@ def report() -> int:
             % (ROOT / "build" / "cr2app" / "warn-cr2app.txt"))
         return 1
 
+    if IS_MAC:
+        bad = check_macos_plist(dist / ("%s.app" % APP_NAME))
+        if bad:
+            return bad
+
     say()
     if IS_WIN:
         say("Запуск: \"%s\"" % (main_dir / ("%s.exe" % APP_NAME)))
@@ -246,10 +334,14 @@ def main() -> int:
                     help="только проверить окружение, не собирать")
     ap.add_argument("--log-level", default="INFO",
                     choices=["TRACE", "DEBUG", "INFO", "WARN", "DEPRECATION", "ERROR"])
+    ap.add_argument("--strict-env", action="store_true",
+                    help="считать ошибкой сборку вне изолированного venv "
+                         "(для сборок, которые пойдут людям)")
     args = ap.parse_args()
 
     say("=" * 70)
     problems = preflight()
+    problems += check_clean_env(args.strict_env)
     say("=" * 70)
 
     if problems:

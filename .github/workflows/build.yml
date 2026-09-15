@@ -62,26 +62,18 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # Установка ЖЁСТКАЯ: никаких «поставим по одному и продолжим».
+      # Раньше здесь был цикл, который при неудаче ставил пакеты по одному и
+      # печатал только ::warning::. На macOS x86_64 rawpy не вставал никогда
+      # (см. комментарий в requirements.txt), и релиз получал ассет
+      # -macos-x86_64.zip без режима проявки RAW - внешне неотличимый от
+      # arm64. Верхняя граница rawpy для Intel теперь стоит прямо в
+      # requirements.txt, так что подстраховка не нужна: если установка
+      # падает, это настоящая поломка, и её надо видеть.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            # На macOS x86_64 у rawpy нет колёс на PyPI (только macosx_11_0_arm64),
-            # поэтому при неудаче ставим по одному и не валим сборку
-            # из-за необязательной зависимости.
-            if ! python -m pip install -r requirements.txt; then
-              echo "::warning::requirements.txt целиком не поставился, ставим по одному пакету"
-              while read -r req; do
-                req="$(echo "$req" | sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-                if [ -z "$req" ]; then
-                  continue
-                fi
-                python -m pip install "$req" || echo "::warning::пакет $req недоступен на ${{ matrix.slug }}, пропущен"
-              done < requirements.txt
-            fi
-          else
-            echo "::warning::requirements.txt не найден - ставим только pyinstaller"
-          fi
+          python -m pip install -r requirements.txt
           python -m pip install pyinstaller
           python -m pip list
 
@@ -90,6 +82,25 @@ jobs:
           python -VV
           python -c "import platform, _tkinter; print('machine:', platform.machine(), 'Tcl', _tkinter.TCL_VERSION, 'Tk', _tkinter.TK_VERSION)"
           pyinstaller --version
+
+      # Отдельно от установки: пакет может «поставиться» и не импортироваться
+      # (несовпадение ABI, битое колесо). Доустановить его в готовый .exe/.app
+      # пользователь не сможет, поэтому проверка обязана падать, а не предупреждать.
+      - name: Verify runtime deps are importable
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          missing = []
+          for mod in ("PIL", "numpy", "rawpy"):
+              try:
+                  importlib.import_module(mod)
+              except BaseException as exc:
+                  missing.append("%s (%s)" % (mod, exc))
+          if missing:
+              print("::error::в сборку не попадут: %s" % ", ".join(missing))
+              sys.exit(1)
+          print("PIL, numpy, rawpy - все импортируются")
+          PY
 
       # Тесты идут ДО сборки и валят задачу при любой ошибке.
       - name: Run test suite
@@ -112,7 +123,12 @@ jobs:
           if [ -f cr2app.spec ]; then
             spec=cr2app.spec
           else
-            spec="$(ls -1 *.spec 2>/dev/null | head -n 1)"
+            # `|| true` обязателен: shell здесь - bash -eo pipefail, ls без
+            # совпадений возвращает 2, pipefail протаскивает это через head, а
+            # присваивание наследует код пайплайна. Шаг умирал прямо здесь, с
+            # кодом 2 и ПУСТЫМ логом, так и не дойдя до строки ::error:: ниже,
+            # ради которой он и написан.
+            spec="$(ls -1 *.spec | head -n 1 || true)"
           fi
           if [ -z "$spec" ]; then
             echo "::error::В корне репозитория нет .spec файла для PyInstaller"
@@ -122,16 +138,79 @@ jobs:
           echo "Using spec: $spec"
 
       - name: Build with PyInstaller
+        env:
+          # Без этого версия тега доезжала только до ИМЕНИ архива: спека
+          # держала зашитое "1.0.0", и каждый релиз выпускал .app с
+          # CFBundleShortVersionString=1.0.0, а exe - вообще без ресурса версии.
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+          # Валить сборку, если Pillow/rawpy/numpy не попали в граф.
+          CR2_REQUIRE_FULL_BUILD: '1'
         run: |
           python -m PyInstaller --noconfirm --clean --log-level=INFO "${{ steps.spec.outputs.spec }}"
           ls -la dist
+
+      # Дымовой тест собранного бандла. Консольный exe для того и собирается.
+      # ВАЖНО: сравнивать текст через grep нельзя - замороженный CLI пишет в
+      # кодировке консоли (на Windows это cp1251) и PYTHONIOENCODING не
+      # слушает, так что UTF-8-шаблон не совпал бы НИ НА ОДНОЙ сборке.
+      # Декодируем явно. Код возврата --version равен 0 и в урезанном случае.
+      - name: Smoke-test the built bundle
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            exe="dist/CR2 Converter/CR2 Converter CLI.exe"
+          else
+            exe="dist/CR2 Converter.app/Contents/MacOS/CR2 Converter CLI"
+          fi
+          python - "$exe" <<'PY'
+          import subprocess, sys
+          out = subprocess.run([sys.argv[1], "--version"],
+                               capture_output=True, check=True).stdout
+          for enc in ("utf-8", "cp1251", "cp866"):
+              try:
+                  text = out.decode(enc)
+                  break
+              except UnicodeDecodeError:
+                  continue
+          else:
+              sys.exit("не удалось декодировать вывод: %r" % out)
+          print(text.strip())
+          for dep in ("Pillow", "rawpy"):
+              if "%s: есть" % dep not in text:
+                  sys.exit("::error::%s отсутствует в собранном бандле" % dep)
+          PY
+
+      # LSBackgroundOnly=true делает .app фоновым агентом: ни значка в Dock, ни
+      # меню, окно Tk нельзя вынести на передний план - пользователь видит, что
+      # по двойному щелчку «ничего не происходит», и в журнале при этом пусто.
+      # Значение приезжает само, от console=True у консольного exe в том же
+      # COLLECT, поэтому проверяем готовый файл, а не намерение.
+      - name: Verify the .app Info.plist
+        if: runner.os == 'macOS'
+        run: |
+          app="$(find dist -mindepth 1 -maxdepth 1 -name '*.app' | head -n 1 || true)"
+          if [ -z "$app" ]; then
+            echo "::error::.app бандл в dist не найден"
+            exit 1
+          fi
+          plist="$app/Contents/Info.plist"
+          plutil -p "$plist"
+          if /usr/libexec/PlistBuddy -c 'Print :LSBackgroundOnly' "$plist" 2>/dev/null | grep -qi true; then
+            echo "::error::Info.plist содержит LSBackgroundOnly=true - бандл запустится фоновым агентом"
+            exit 1
+          fi
+          if ! /usr/libexec/PlistBuddy -c 'Print :NSHighResolutionCapable' "$plist" 2>/dev/null | grep -qi true; then
+            echo "::error::Info.plist без NSHighResolutionCapable - окно будет мыльным на retina"
+            exit 1
+          fi
 
       # --- Упаковка: Windows ---------------------------------------------------
       - name: Package (Windows, zip onedir)
         if: runner.os == 'Windows'
         run: |
           mkdir -p artifacts
-          app="$(find dist -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          # `|| true`: без него сбой find/head убил бы шаг раньше, чем
+          # отработает проверка с ::error:: ниже (bash -eo pipefail).
+          app="$(find dist -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
           if [ -z "$app" ]; then
             echo "::error::onedir-папка в dist не найдена"
             exit 1
@@ -148,7 +227,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p artifacts
-          app="$(find dist -mindepth 1 -maxdepth 1 -name '*.app' | head -n 1)"
+          app="$(find dist -mindepth 1 -maxdepth 1 -name '*.app' | head -n 1 || true)"
           if [ -z "$app" ]; then
             echo "::error::.app бандл в dist не найден"
             exit 1
@@ -196,7 +275,15 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: [build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Именно ПУШ тега, а не «ref похож на тег».  Диалог Run workflow позволяет
+    # выбрать тег, и тогда github.ref тоже был бы refs/tags/vX: ручной запуск
+    # «перепроверить сборку под macOS» публиковал бы публичный релиз, чего
+    # никто от этой кнопки не ждёт.  Матрица сборки при dispatch по-прежнему
+    # отрабатывает полностью - запрещена только публикация.
+    if: >-
+      github.event_name == 'push'
+      && github.ref_type == 'tag'
+      && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -225,8 +312,25 @@ jobs:
           GH_REPO: ${{ github.repository }}
         # gh делает draft -> заливает файлы -> публикует; только такой порядок
         # работает в репозиториях с включёнными immutable releases.
+        #
+        # Шаг должен переживать повторный запуск. gh release create отказывает
+        # на теге, у которого релиз уже есть, а заливка файлов идёт ПОСЛЕ
+        # создания черновика - то есть оборванная загрузка (502 на архиве в
+        # 200 МБ) оставляет недозаполненный черновик, и «Re-run failed jobs»
+        # либо падает, либо плодит ещё один черновик на тот же тег.
+        # Черновик от упавшего запуска удаляем, опубликованный релиз - никогда:
+        # при immutable releases ассеты в него всё равно не дописать, и молча
+        # снести чужой релиз хуже, чем громко остановиться.
         run: |
-          gh release create "$GITHUB_REF_NAME" dist-artifacts/* \
-            --title "$GITHUB_REF_NAME" \
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null | grep -qx true; then
+            echo "::warning::Найден черновик релиза $tag от упавшего запуска - удаляю и создаю заново"
+            gh release delete "$tag" --yes        # тег НЕ трогаем: без --cleanup-tag
+          elif gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::Релиз $tag уже опубликован. Дописать ассеты нельзя: удалите релиз (gh release delete $tag) или выпустите новый тег."
+            exit 1
+          fi
+          gh release create "$tag" dist-artifacts/* \
+            --title "$tag" \
             --generate-notes \
             --verify-tag

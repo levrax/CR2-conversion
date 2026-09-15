@@ -78,7 +78,9 @@ APP_ID = "CR2Converter"               # имя папки настроек вн�
 SETTINGS_NAME = "cr2_gui_settings.json"
 ERROR_LOG_NAME = "cr2_gui_error.log"
 
-ERROR_LOG_PATH = APP_DIR / ERROR_LOG_NAME
+# ERROR_LOG_PATH определяется ниже, рядом с SETTINGS_PATH: ему нужны те же
+# проверки (.app, доступность на запись), а они опираются на функции, которых
+# в этой точке файла ещё нет.
 
 
 # ---------------- системное окно с ошибкой (без tkinter) ----------------
@@ -103,6 +105,12 @@ def native_error_dialog(title: str, text: str) -> bool:
     Linux:   zenity, затем kdialog, затем xmessage; если нет ничего - False,
              и вызывающий код остаётся с записью в журнале, что уже не молчание.
     """
+    # На сборочной машине окно показывать НЕКОМУ, а ждать оно будет вечно:
+    # MessageBoxW таймаута не имеет вовсе, osascript - 600 с.  Один такой вызов
+    # вешает шаг CI на десять минут и валит его без единой строки объяснения.
+    if os.environ.get("CI"):
+        return False
+
     if IS_WINDOWS:
         try:
             ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)
@@ -220,22 +228,36 @@ def user_config_dir() -> Path:
     return (Path(base) if base else home / ".config") / APP_ID.lower()
 
 
-def settings_path() -> Path:
-    """Куда класть cr2_gui_settings.json.
+def _prefer_app_dir() -> bool:
+    """Можно ли класть свои файлы рядом с программой.
 
-    Windows: рядом с программой - ровно как было.  Программа переносимая: папку
-        можно скопировать на флешку вместе с настройками.
-    macOS/Linux: тоже рядом с программой, пока туда можно писать - переносимость
-        важнее единообразия.  А вот если программа лежит внутри .app или в
-        системном каталоге (/Applications, /usr/local/bin), запись туда либо
-        запрещена, либо ломает подпись бандла - тогда берём стандартную папку
-        настроек системы.
+    Windows: всегда - ровно как было.  Программа переносимая: папку можно
+        скопировать на флешку вместе с настройками и журналом.
+    macOS/Linux: тоже рядом с программой, пока туда можно писать -
+        переносимость важнее единообразия.  А вот если программа лежит внутри
+        .app или в системном каталоге (/Applications, /usr/local/bin), запись
+        туда либо запрещена, либо ломает подпись бандла.
     """
     if IS_WINDOWS:
-        return APP_DIR / SETTINGS_NAME
-    if not _inside_macos_app_bundle(APP_DIR) and _dir_is_writable(APP_DIR):
-        return APP_DIR / SETTINGS_NAME
-    return user_config_dir() / SETTINGS_NAME
+        return True
+    return not _inside_macos_app_bundle(APP_DIR) and _dir_is_writable(APP_DIR)
+
+
+def settings_path() -> Path:
+    """Куда класть cr2_gui_settings.json."""
+    return (APP_DIR if _prefer_app_dir() else user_config_dir()) / SETTINGS_NAME
+
+
+def error_log_path() -> Path:
+    """Куда класть cr2_gui_error.log.
+
+    Те же проверки, что и у settings_path().  Раньше журнал безусловно
+    привязывался к папке программы, и на macOS/Linux из каталога только для
+    чтения выходило так: окно писало в строке состояния «журнал будет здесь»,
+    record_error по факту неудачи сваливался во временную папку, а пользователь
+    искал файл там, где ему сказали, и не находил.
+    """
+    return (APP_DIR if _prefer_app_dir() else user_config_dir()) / ERROR_LOG_NAME
 
 
 def legacy_text_encodings() -> tuple:
@@ -450,6 +472,9 @@ def theme_honours_widget_colors(widget=None) -> bool:
 
 
 SETTINGS_PATH = settings_path()
+# Оба имени app.py подменяет по имени в _retarget_app_paths() для собранного
+# приложения, поэтому они обязаны оставаться модульными переменными.
+ERROR_LOG_PATH = error_log_path()
 
 POLL_MS = 60           # период опроса очереди (50-100 мс)
 MAX_DRAIN = 200        # не более стольких сообщений за один тик
@@ -522,6 +547,15 @@ def _fatal_bootstrap(header: str, exc: BaseException) -> None:
     """
     text = "%s: %s: %s" % (header, type(exc).__name__, exc)
     path = record_error("bootstrap", text + "\n" + traceback.format_exc())
+    if __name__ != "__main__":
+        # Модуль ИМПОРТИРОВАН, а не запущен: прогон тестов, проба при упаковке,
+        # app.py в собранном приложении.  os._exit(1) убил бы чужой процесс
+        # мимо unittest, atexit и всех except — весь набор тестов обрывался на
+        # полуслове без трассировки, без строки «FAILED» и без единого skip, а
+        # на Windows перед этим ещё и вешал сборку на модальном окне без
+        # таймаута.  Отдаём ошибку вызывающему коду: у app.py есть свой
+        # _fatal(), а тест превращает её в skip.
+        raise exc
     native_error_dialog(
         "Конвертер CR2",
         "%s\n\nПодробности записаны в файл:\n%s\n\n"
@@ -599,7 +633,19 @@ def install_crash_hooks(root: tk.Misc | None = None) -> None:
 
 
 def ui_scale(widget: tk.Misc) -> float:
-    """1.0 при 96 DPI, 2.0 при 192 DPI. Только для ПИКСЕЛЬНЫХ величин."""
+    """1.0 при 96 DPI, 2.0 при 192 DPI. Только для ПИКСЕЛЬНЫХ величин.
+
+    macOS: Tk/aqua ВСЕГДА сообщает 72 dpi — окно живёт в логических точках, а
+    retina обслуживает система, и множитель заднего буфера от Tk скрыт (ровно
+    поэтому enable_dpi_awareness() возвращает там "n/a").  Делить 72 на 96
+    нельзя: получалось вечное 0.75, то есть все пиксельные размеры ужимались на
+    четверть — и одновременно системный шрифт там 13 pt против 9 pt Segoe UI,
+    под которые константы подбирались.  Строки таблицы (rowheight 22 -> 16)
+    обрезали текст, окно открывалось 765x570 вместо 1020x760, а minsize
+    позволял сжать его до 570x420, где кнопки и колонки уже не помещаются.
+    """
+    if IS_MACOS:
+        return 1.0
     try:
         return float(widget.winfo_fpixels("1i")) / 96.0
     except Exception:
@@ -764,6 +810,11 @@ class MDone:
     full: int = 0       # файлов, у которых превью равно полному кадру
     seen: int = 0       # файлов реально просмотрено (ok + failed + skipped)
     crashed: str = ""   # непустая строка == задание НЕ доведено до конца
+    # Куда record_error записал трассировку НА САМОМ ДЕЛЕ.  Предпочтительный
+    # путь может оказаться недоступен (только чтение, флешка), и тогда запись
+    # уходит во временную папку; показывать пользователю надо файл, который
+    # существует, а не тот, который мы хотели.
+    log_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1060,7 @@ def job_worker(spec: dict, opts, probe_only: bool,
     # каждом нормальном выходе, поэтому и KeyboardInterrupt/SystemExit, которые
     # не ловятся `except Exception`, тоже не выдадут себя за успешный прогон.
     crash = ""
+    crash_log = ""          # реальный путь журнала, см. except ниже
     min_ratio = getattr(opts, "min_preview_ratio", 0.4)
     try:
         q.put(MLog("Поиск файлов CR2…"))
@@ -1116,7 +1168,9 @@ def job_worker(spec: dict, opts, probe_only: bool,
                               on_progress=on_progress, cancel=cancel)
         crash = ""
     except Exception as exc:
-        record_error("job_worker", traceback.format_exc())
+        # Возвращённый путь НЕ выбрасываем: только он говорит, куда запись
+        # действительно легла.
+        crash_log = str(record_error("job_worker", traceback.format_exc()))
         crash = "%s: %s" % (type(exc).__name__, exc)
         q.put(MLog("Сбой обработки: %s" % crash, "err"))
     finally:
@@ -1127,7 +1181,7 @@ def job_worker(spec: dict, opts, probe_only: bool,
                     dpp=counters["dpp"], small=counters["small"],
                     full=counters["full"],
                     seen=counters["ok"] + counters["failed"] + counters["skipped"],
-                    crashed=crash))
+                    crashed=crash, log_path=crash_log))
 
 
 # --------------------------------------------------------------------------
@@ -1442,9 +1496,20 @@ class App(ttk.Frame):
 
         style = ttk.Style()
         try:
-            style.configure("Treeview", rowheight=self._px(22))
+            # Высота строки обязана следовать за ШРИФТОМ, а не только за DPI:
+            # системный шрифт на разных платформах разной кегли, и 22
+            # логических пикселя, подобранные под Segoe UI 9 pt, обрезают
+            # текст под более крупным системным шрифтом.  На Windows
+            # linespace + 4 меньше масштабированных 22, так что вид не меняется.
+            from tkinter import font as _tkfont
+            _line = _tkfont.nametofont("TkDefaultFont", self).metrics("linespace")
+            style.configure("Treeview",
+                            rowheight=max(self._px(22), int(_line) + self._px(4)))
         except Exception:
-            pass
+            try:
+                style.configure("Treeview", rowheight=self._px(22))
+            except Exception:
+                pass
 
         cols = ("file", "preview", "share", "recipe", "status")
         self.tree = ttk.Treeview(table, columns=cols, show="headings",
@@ -1519,8 +1584,26 @@ class App(ttk.Frame):
         self.log_text = tk.Text(self.log_frame, height=8, wrap="none",
                                 state="disabled", font=monospace_font(self))
         self.log_text.grid(row=0, column=0, sticky="nsew")
-        self.log_text.tag_configure("err", foreground="#b00000")
-        self.log_text.tag_configure("warn", foreground="#a06000")
+        # Тег задаёт ТОЛЬКО цвет текста, а фон у tk.Text системный и
+        # динамический (на macOS это systemTextBackgroundColor).  Бандл сам
+        # разрешает тёмную тему (NSRequiresAquaSystemAppearance=False в
+        # cr2app.spec), и тёмно-красный ложился на почти чёрное: ровные строки
+        # белые и читаемые, а строки ОШИБОК — те, ради которых журнал и
+        # открывают, — почти не видны.  Поэтому сначала выясняем фактический
+        # фон, потом берём пару под него.
+        try:
+            _rgb = self.log_text.winfo_rgb(self.log_text.cget("background"))
+            _luma = (0.299 * (_rgb[0] >> 8) + 0.587 * (_rgb[1] >> 8)
+                     + 0.114 * (_rgb[2] >> 8)) / 255.0
+        except Exception:                                   # pragma: no cover
+            _luma = 1.0                                     # считаем фон светлым
+        _err, _warn = (("#ff6b6b", "#ffb454") if _luma < 0.5
+                       else ("#b00000", "#a06000"))
+        for _tag, _color in (("err", _err), ("warn", _warn)):
+            try:
+                self.log_text.tag_configure(_tag, foreground=_color)
+            except Exception:                               # pragma: no cover
+                pass
         lsb = ttk.Scrollbar(self.log_frame, orient="vertical",
                             command=self.log_text.yview)
         lsb.grid(row=0, column=1, sticky="ns")
@@ -2218,7 +2301,11 @@ class App(ttk.Frame):
             tail = "Сбой обработки, файлы не сконвертированы (%s)" % msg.crashed
             self.status_var.set(tail)
             self.log(tail, "err")
-            _show_error_box("Сбой обработки: %s" % msg.crashed, _error_log_path())
+            # Именно msg.log_path: это файл, в который трассировка реально
+            # записалась, а не тот, который мы предпочли бы.
+            _show_error_box("Сбой обработки: %s" % msg.crashed,
+                            Path(msg.log_path) if msg.log_path
+                            else _error_log_path())
             self._save_settings()
             return
         summary_text, summary_warn = self._build_summary(msg)

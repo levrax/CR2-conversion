@@ -19,6 +19,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -1077,6 +1078,30 @@ class TestFindCr2(Base):
     def test_extensions_constant(self):
         self.assertEqual(cr2_core.CR2_EXTS, (".cr2",))
 
+    def test_appledouble_sidecars_are_skipped(self):
+        """._IMG.CR2 - спутник macOS, а не фотография.
+
+        macOS кладёт такой файл рядом с каждым на томе, который не умеет
+        хранить расширенные атрибуты: любая карта памяти (exFAT), флешка, шара
+        SMB.  splitext читает его как '.CR2', и папка из 155 снимков давала 310
+        строк, 155 из них красных, — про файлы, которых в Finder даже не видно.
+        """
+        root = self.out / "карта"
+        root.mkdir()
+        (root / "IMG_0001.CR2").write_bytes(b"x")
+        (root / "._IMG_0001.CR2").write_bytes(b"\x00\x05AppleDouble")
+        (root / ".DS_Store").write_bytes(b"x")
+        found = [p.name for p in find_cr2(root)]
+        self.assertEqual(found, ["IMG_0001.CR2"])
+
+    def test_macosx_directory_is_not_walked(self):
+        """__MACOSX — то, что остаётся от Mac-архива, распакованного в Windows."""
+        root = self.out / "распакованное"
+        (root / "__MACOSX").mkdir(parents=True)
+        (root / "IMG_0002.CR2").write_bytes(b"x")
+        (root / "__MACOSX" / "._IMG_0002.CR2").write_bytes(b"\x00\x05")
+        self.assertEqual([p.name for p in find_cr2(root)], ["IMG_0002.CR2"])
+
 
 # ==========================================================================
 # Dataclass surface
@@ -1258,6 +1283,63 @@ class TestDestinationPlanning(Base):
         plan = cr2_core.plan_destinations([a, b], ConvertOptions(out_dir=self.out / "o"))
         self.assertNotEqual(cr2_core._dst_key(plan[0][1]), cr2_core._dst_key(plan[1][1]))
 
+    def test_plan_dedupes_case_on_a_case_folding_posix_volume(self):
+        """Регрессия: на macOS нормализация ключа назначения ИСЧЕЗАЛА.
+
+        _dst_key опирался только на os.path.normcase, а на POSIX это пустая
+        функция.  При этом СТАНДАРТНЫЙ том macOS (APFS, до него HFS+) сам
+        регистронезависим: IMG_0042.jpg и img_0042.jpg — один физический файл.
+        plan_destinations считал их разными, не переименовывал и не оставлял
+        пометки, _DestLock выдавал двум потокам РАЗНЫЕ замки, и два снимка
+        писались в один файл — обе строки при этом зелёные.
+        """
+        a = mk.make_cr2(self.out / "a" / "IMG_0042.CR2", preview_size=(64, 48),
+                        thumb_size=(32, 24), include_ifd2=False)
+        b = mk.make_cr2(self.out / "b" / "img_0042.CR2", preview_size=(66, 48),
+                        thumb_size=(32, 24), include_ifd2=False)
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.object(cr2_core, "_fs_folds_case",
+                                  lambda folder, *, default: True):
+            plan = cr2_core.plan_destinations(
+                [a, b], ConvertOptions(out_dir=self.out / "o"))
+            keys = [cr2_core._dst_key(d) for _s, d, _n in plan]
+        self.assertEqual(len(set(keys)), 2, "коллизия не разведена")
+        self.assertNotEqual(plan[0][1].name.lower(), plan[1][1].name.lower())
+        self.assertTrue(plan[1][2], "переименование должно быть объяснено")
+
+    def test_dst_key_ignores_unicode_normalisation_on_posix(self):
+        """Ёлка в NFC и в NFD — одно имя для тома macOS."""
+        import unicodedata
+        nfc = self.out / "o" / (unicodedata.normalize("NFC", "Ёлка") + ".jpg")
+        nfd = self.out / "o" / (unicodedata.normalize("NFD", "Ёлка") + ".jpg")
+        self.assertNotEqual(str(nfc), str(nfd), "фикстура собрана неверно")
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.object(cr2_core, "_fs_folds_case",
+                                  lambda folder, *, default: True):
+            self.assertEqual(cr2_core._dst_key(nfc), cr2_core._dst_key(nfd))
+
+    def test_dst_key_keeps_case_on_a_case_sensitive_volume(self):
+        """На ext4/APFS-CS два имени — действительно два файла."""
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.object(cr2_core, "_fs_folds_case",
+                                  lambda folder, *, default: False):
+            self.assertNotEqual(cr2_core._dst_key(self.out / "A.jpg"),
+                                cr2_core._dst_key(self.out / "a.jpg"))
+
+    def test_input_key_does_not_over_merge_when_probe_fails(self):
+        """У ВХОДА безопасная сторона обратная: склеивание теряет снимок."""
+        probe_args = {}
+
+        def fake(folder, *, default):
+            probe_args["default"] = default
+            return default
+
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.object(cr2_core, "_fs_folds_case", fake):
+            self.assertNotEqual(cr2_core.input_key(self.out / "A.CR2"),
+                                cr2_core.input_key(self.out / "a.CR2"))
+        self.assertIs(probe_args["default"], False)
+
     def test_plan_is_deterministic(self):
         srcs = self.make_colliding(("x", "y", "z"))
         opts = ConvertOptions(out_dir=self.out / "o")
@@ -1307,6 +1389,28 @@ class TestAtomicWrite(Base):
                 self.assertLessEqual(len(str(tmp)), len(str(dst)) if stem_len > 8
                                      else len(str(tmp)))
                 self.assertLessEqual(len(tmp.name), 255)
+
+    def test_temp_name_fits_a_posix_byte_budget(self):
+        """Регрессия: 255 считалось в СИМВОЛАХ, а APFS/HFS+/ext4 считают в БАЙТАХ.
+
+        Кириллица стоит два байта, то есть бюджет фактически удваивался: имя
+        назначения из 120-125 кириллических символов том принимает, а временное
+        имя рядом с ним — уже нет, и файл падал с ENAMETOOLONG («File name too
+        long») там, где прямая запись в dst прошла бы.  Инвариант функции —
+        «принял dst, примет и временный» — был вывернут наизнанку.
+        """
+        enc = "utf-8"
+        with mock.patch.object(cr2_core, "_ON_NT", False), \
+                mock.patch.object(cr2_core.sys, "getfilesystemencoding",
+                                  lambda: enc):
+            for n in (119, 120, 122, 125, 130, 300):
+                with self.subTest(n=n):
+                    dst = Path("/Users/ivan/Pictures") / (("я" * n) + ".jpg")
+                    tmp = cr2_core._tmp_path(dst)
+                    self.assertLessEqual(len(tmp.name.encode(enc)), 255)
+                    # Форма имени обязана уцелеть при любой длине, иначе
+                    # sweep_stale_tmp() перестанет узнавать свои же хвосты.
+                    self.assertRegex(tmp.name, cr2_core._TMP_RE)
 
     def test_long_file_name_converts(self):
         stem = "L" * 240
@@ -1788,8 +1892,8 @@ class TestConvertOneApi(Base):
 class TestMeasuredBodyShapes(Base):
     """The two body shapes that decide what the user actually gets.
 
-    Measured on the user's own library (155 files, C:\\Users\\Lenovo\\Desktop\\
-    01.09.26 + 123 + 23.04.2026): every file is a Canon EOS 550D carrying a
+    Measured on a real library of 155 files from three shoots: every file
+    is a Canon EOS 550D carrying a
     5184x3456 IFD0 preview - byte-for-byte the raw dimensions - and none of them
     carries a DPP recipe.  The half-resolution preview the research warned about
     is real, but it belongs to older bodies; both shapes are pinned here so a
@@ -2052,8 +2156,16 @@ class TestGuiModule(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        import importlib
         import importlib.util
         from importlib.machinery import SourceFileLoader
+        # tkinter проверяется ДО exec_module: cr2_gui импортирует его на уровне
+        # модуля, и без этой пробы весь класс падал бы с ERROR на машине без
+        # tcl/tk вместо честного skip.
+        try:
+            importlib.import_module("tkinter")
+        except BaseException as exc:
+            raise unittest.SkipTest("tkinter недоступен: %s" % exc)
         path = str(Path(__file__).resolve().parent / "cr2_gui.pyw")
         spec = importlib.util.spec_from_file_location(
             "cr2_gui_under_test", path, loader=SourceFileLoader("cr2_gui_under_test", path))

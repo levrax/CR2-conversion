@@ -133,12 +133,60 @@ def _retarget_app_paths(gui) -> None:
 # --------------------------------------------------------------------------
 
 
+def _applescript_string(text: str) -> str:
+    """Строковый литерал AppleScript. Без него кавычка в пути ломает скрипт."""
+    body = (str(text).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t"))
+    return '"%s"' % body
+
+
+def _native_dialog(title: str, text: str) -> bool:
+    """Системное окно с ошибкой без tkinter. Никогда не бросает исключение.
+
+    Повторяет cr2_gui.native_error_dialog, и повторяет намеренно: _fatal()
+    существует ровно для случая «cr2_gui не загрузился», то есть позвать
+    оригинал неоткуда.  subprocess импортируется ВНУТРИ функции - app.py
+    сознательно почти ничего не тянет на уровне модуля, чтобы _fatal работал
+    в полуживом интерпретаторе.
+    """
+    try:
+        import subprocess
+    except Exception:
+        return False
+    if sys.platform == "darwin":
+        script = ("display dialog %s with title %s buttons {\"OK\"} "
+                  "default button 1 with icon stop"
+                  % (_applescript_string(text), _applescript_string(title)))
+        cmds = [["osascript", "-e", script]]
+    else:
+        cmds = [
+            ["zenity", "--error", "--no-wrap", "--title", title, "--text", text],
+            ["kdialog", "--title", title, "--error", text],
+            ["xmessage", "-center", "%s\n\n%s" % (title, text)],
+        ]
+    for cmd in cmds:
+        try:
+            done = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=600,
+                                  check=False)
+        except Exception:
+            continue
+        # Ненулевой код - окно не показано (обычно нет дисплея): пробуем
+        # следующую программу, а не рапортуем об успехе.
+        if done.returncode == 0:
+            return True
+    return False
+
+
 def _fatal(header: str, detail: str) -> None:
     """Показать окно и выйти. Работает без tkinter и без cr2_gui.
 
-    Ровно та же логика, что в cr2_gui._fatal_bootstrap, но применимая к
-    ситуации «cr2_gui вообще не загрузился»: тогда его собственный
-    _fatal_bootstrap ещё не существует.
+    Та же логика, что в cr2_gui._fatal_bootstrap: запись в журнал, СИСТЕМНОЕ
+    окно (на всех трёх платформах), выход.  Раньше окно было только на
+    Windows, а всё остальное уходило в sys.stderr - который в приложении,
+    запущенном из Finder, выше по этому же файлу подменён на os.devnull.
+    То есть на macOS отказ загрузки выглядел так: значок в Dock подпрыгнул
+    один раз и исчез, ни окна, ни намёка на то, что где-то есть журнал.
     """
     text = "%s\n\n%s" % (header, detail)
     where = ""
@@ -157,6 +205,12 @@ def _fatal(header: str, detail: str) -> None:
         except Exception:
             pass
     else:
+        try:
+            _native_dialog(APP_TITLE, text + where)
+        except Exception:
+            pass
+        # stderr пишем ВСЕГДА, а не только при неудаче окна: когда приложение
+        # запущено из терминала, именно этот текст и нужен.
         try:
             sys.stderr.write(text + where + "\n")
             sys.stderr.flush()

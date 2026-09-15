@@ -29,6 +29,7 @@ cr2_gui.pyw не переименовывается: на него ссылаю�
 """
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -46,8 +47,37 @@ ROOT = Path(SPECPATH).resolve()          # SPECPATH подставляет PyIns
 BUILD_DIR = Path(workpath).resolve()     # workpath == build/<имя спеки>
 
 APP_NAME = "CR2 Converter"
-APP_VERSION = "1.0.0"
 BUNDLE_ID = "com.cr2converter.app"
+
+
+def _resolve_version():
+    """Версия сборки: из переменной окружения APP_VERSION, иначе 1.0.0.
+
+    CI вычисляет её из тега («Resolve version» в build.yml) и передаёт сюда
+    через env.  Раньше здесь стояла зашитая строка, и КАЖДЫЙ релиз с любого
+    тега выпускал бандл с версией 1.0.0 — отличить v1.0.0 от v1.1.0 после
+    распаковки было нечем.
+    """
+    raw = (os.environ.get("APP_VERSION") or "1.0.0").strip()
+    if raw[:1] in ("v", "V"):
+        raw = raw[1:]
+    return raw or "1.0.0"
+
+
+def _plist_version(raw):
+    """CFBundleShortVersionString/CFBundleVersion: 1-3 числа через точку.
+
+    Apple других форм не принимает, а запасное значение CI для сборки без тега
+    выглядит как «0.0.0+abc1234» — плюс там недопустим и валит проверку при
+    нотаризации.  '0.0.0+abc1234' -> '0.0.0', '1.1.0-rc.2' -> '1.1.0'.
+    """
+    head = re.split(r"[+-]", raw, 1)[0]
+    parts = [p for p in head.split(".") if p.isdigit()][:3]
+    return ".".join(parts) if parts else "1.0.0"
+
+
+APP_VERSION = _resolve_version()          # полная строка: показывать людям
+PLIST_VERSION = _plist_version(APP_VERSION)   # очищенная: только для Info.plist
 
 ENTRY = ROOT / "app.py"
 GUI_PYW = ROOT / "cr2_gui.pyw"
@@ -70,7 +100,18 @@ ALIAS_PY = ALIAS_DIR / "cr2_gui.py"
 shutil.copyfile(GUI_PYW, ALIAS_PY)
 
 # --------------------------------------------------------------------------
-# Значок (необязателен: нет файла - нет значка, сборка не падает)
+# Значок.
+#
+# ВНИМАНИЕ: icon=None НЕ означает «без значка».  PyInstaller подставляет
+# СВОЙ bootloader/images/icon-windowed.ico (или icon-console.ico консольному
+# exe) — building/api.py:598-604 — и собранные файлы уходят пользователю с
+# логотипом PyInstaller.  Подавляет значок только строка "NONE"
+# (api.py:786), поэтому ниже у обоих EXE стоит `icon=ICON or "NONE"`.
+#
+# BUNDLE такой возможности не даёт вовсе: osx.py зовёт normalize_icon_type(),
+# а та падает с FileNotFoundError на пути "NONE".  Значит на macOS выбор
+# только один: либо положить assets/app.icns, либо .app и его плитка в Dock
+# будут носить значок PyInstaller.
 # --------------------------------------------------------------------------
 
 _ico = ROOT / "assets" / "app.ico"
@@ -192,6 +233,32 @@ for _must in ("cr2_gui", "cr2_core"):
             % (_must, Path(workpath) / ("warn-%s.txt" % specnm))
         )
 
+
+# Pillow/rawpy/numpy нужны СОБРАННОМУ приложению: доустановить их внутрь
+# бандла пользователь не может.  Из исходников программа работает и без них,
+# поэтому локальная сборка «на посмотреть» не обязана падать — а вот выпуск
+# обязан.  CR2_REQUIRE_FULL_BUILD=1 выставляет CI.
+REQUIRE_FULL = bool(os.environ.get("CR2_REQUIRE_FULL_BUILD"))
+
+
+def _require_runtime_deps(collected, which):
+    if not REQUIRE_FULL:
+        return
+    for _must in ("rawpy", "numpy", "PIL"):
+        if not any(n == _must or n.startswith(_must + ".") for n in collected):
+            raise SystemExit(
+                "cr2app.spec: зависимость %r отсутствует в окружении сборки "
+                "(%s).\nВ готовом дистрибутиве её доустановить нельзя — "
+                "сборка остановлена.\n"
+                "python -m pip install -r requirements.txt\n"
+                "Подробности: %s"
+                % (_must, which,
+                   Path(workpath) / ("warn-%s.txt" % specnm))
+            )
+
+
+_require_runtime_deps(_collected, "оконная часть")
+
 pyz = PYZ(a.pure)
 
 # --------------------------------------------------------------------------
@@ -219,13 +286,70 @@ b = Analysis(
     optimize=0,
 )
 
-if "cr2_core" not in {name for name, _path, _typ in b.pure}:
+_collected_cli = {name for name, _path, _typ in b.pure}
+if "cr2_core" not in _collected_cli:
     raise SystemExit(
         "cr2app.spec: cr2_core не попал в консольную сборку. Смотрите %s"
         % (Path(workpath) / ("warn-%s.txt" % specnm))
     )
+_require_runtime_deps(_collected_cli, "консольная часть")
 
 pyz_cli = PYZ(b.pure)
+
+# --------------------------------------------------------------------------
+# Ресурс версии Windows
+# --------------------------------------------------------------------------
+# Без него вкладка «Свойства -> Подробно» у обоих exe ПУСТАЯ: ни версии, ни
+# названия продукта.  После распаковки архива отличить одну сборку от другой
+# нечем, а неподписанный файл без единого поля версии вдобавок хуже выглядит
+# для SmartScreen и эвристик антивирусов.
+#
+# filevers/prodvers — только числа (4 штуки), поэтому туда идёт очищенная
+# PLIST_VERSION; строковые поля показывают APP_VERSION целиком, вместе с
+# «+abc1234» у сборок без тега.
+
+VERSION_GUI = None
+VERSION_CLI = None
+
+if IS_WIN:
+    from PyInstaller.utils.win32.versioninfo import (
+        FixedFileInfo, StringFileInfo, StringStruct, StringTable,
+        VarFileInfo, VarStruct, VSVersionInfo,
+    )
+
+    def _version_numbers():
+        parts = [int(p) for p in PLIST_VERSION.split(".")]
+        while len(parts) < 4:
+            parts.append(0)
+        return tuple(parts[:4])
+
+    def _win_version_resource(exe_name, description):
+        nums = _version_numbers()
+        return VSVersionInfo(
+            ffi=FixedFileInfo(filevers=nums, prodvers=nums, mask=0x3F,
+                              flags=0x0, OS=0x40004, fileType=0x1,
+                              subtype=0x0, date=(0, 0)),
+            kids=[
+                # 0409 = en-US, 04B0 = 1200 = Unicode; кириллица в значениях
+                # хранится в UTF-16 и от кодовой страницы не зависит.
+                StringFileInfo([StringTable("040904B0", [
+                    StringStruct("CompanyName", APP_NAME),
+                    StringStruct("FileDescription", description),
+                    StringStruct("FileVersion", APP_VERSION),
+                    StringStruct("InternalName", exe_name),
+                    StringStruct("LegalCopyright", APP_NAME),
+                    StringStruct("OriginalFilename", "%s.exe" % exe_name),
+                    StringStruct("ProductName", APP_NAME),
+                    StringStruct("ProductVersion", APP_VERSION),
+                ])]),
+                VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
+            ],
+        )
+
+    VERSION_GUI = _win_version_resource(
+        APP_NAME, "Конвертер CR2 в JPEG без потерь")
+    VERSION_CLI = _win_version_resource(
+        APP_NAME_CLI, "Конвертер CR2 в JPEG без потерь (консоль)")
 
 # --------------------------------------------------------------------------
 # Исполняемый файл (onedir на обеих платформах)
@@ -258,8 +382,10 @@ exe = EXE(
     target_arch=None,
     codesign_identity=os.environ.get("CODESIGN_IDENTITY") or None,
     entitlements_file=None,
-    icon=ICON,
-    version=None,                      # это путь к ФАЙЛУ ресурса версии Windows
+    # "NONE" (строка!), а не None: None заставляет PyInstaller подставить
+    # СВОЙ значок, см. комментарий в разделе «Значок» выше.
+    icon=ICON or "NONE",
+    version=VERSION_GUI,               # None везде, кроме Windows
     contents_directory="_internal",
 )
 
@@ -279,16 +405,30 @@ exe_cli = EXE(
     target_arch=None,
     codesign_identity=os.environ.get("CODESIGN_IDENTITY") or None,
     entitlements_file=None,
-    icon=ICON,
-    version=None,
+    icon=ICON or "NONE",
+    version=VERSION_CLI,
     contents_directory="_internal",
 )
 
 # Оба exe в одной папке: библиотеки, Tcl/Tk и питон у них общие, вторая копия
 # 70 МБ никому не нужна.  Совпадающие записи COLLECT отбрасывает сам.
+#
+# ПОРЯДОК EXE ЗДЕСЬ ЗНАЧИМ.  COLLECT.__init__ перебирает аргументы и делает
+# `self.console = arg.console` БЕЗ break (PyInstaller building/api.py:1118-
+# 1127), то есть наследует настройки ПОСЛЕДНЕГО EXE — заодно target_arch,
+# codesign_identity и entitlements_file.  Когда последним шёл консольный
+# exe_cli, BUNDLE получал console=True и писал в Info.plist
+# LSBackgroundOnly=True: .app стартовал фоновым агентом без значка в Dock и
+# без возможности вынести окно на передний план.  Оконный exe идёт последним.
+#
+# На CFBundleExecutable порядок не влияет: BUNDLE берёт первый EXECUTABLE из
+# уже ОТСОРТИРОВАННОГО TOC (osx.py:123-129), а "CR2 Converter" — префикс
+# "CR2 Converter CLI" и потому сортируется раньше.
+# contents_directory COLLECT берёт у ПЕРВОГО EXE (отдельный цикл с break,
+# api.py:1111-1116), у обоих он "_internal", так что перестановка безопасна.
 coll = COLLECT(
-    exe,
     exe_cli,
+    exe,
     a.binaries,
     a.datas,
     b.binaries,
@@ -313,12 +453,22 @@ if IS_MAC:
         bundle_identifier=BUNDLE_ID,
         # Строка, и только строка: нестроковый CFBundleShortVersionString
         # роняет бандл на старте (PyInstaller #4466).
-        version=APP_VERSION,
+        version=PLIST_VERSION,
         info_plist={
-            "CFBundleShortVersionString": APP_VERSION,
-            "CFBundleVersion": APP_VERSION,
+            "CFBundleShortVersionString": PLIST_VERSION,
+            "CFBundleVersion": PLIST_VERSION,
             "CFBundleDisplayName": APP_NAME,
-            # BUNDLE ставит это сам при console=False, но пусть будет явно.
+            # Явно и безусловно, а НЕ «BUNDLE поставит сам при console=False».
+            # BUNDLE берёт console у COLLECT, а тот наследует его у последнего
+            # переданного EXE (см. комментарий у COLLECT выше).  При
+            # console=True osx.py:638 пишет LSBackgroundOnly=True, и .app
+            # запускается фоновым агентом — без значка в Dock, без строки меню,
+            # окно нельзя активировать.  Спековый info_plist накладывается
+            # ПОСЛЕ умолчаний (osx.py:644 info_plist_dict.update), поэтому
+            # написанное здесь выигрывает при любом порядке аргументов.
+            "LSBackgroundOnly": False,
+            # Тоже обязательно явно: ветку с NSHighResolutionCapable osx.py
+            # выполняет только при console=False, на неё полагаться нельзя.
             "NSHighResolutionCapable": True,
             # По документации необходим, чтобы окно рисовалось в retina.
             "NSPrincipalClass": "NSApplication",
