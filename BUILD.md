@@ -12,7 +12,7 @@
 python -m venv .venv
 .venv\Scripts\activate
 python -m pip install -r requirements.txt
-python -m pip install pyinstaller
+python -m pip install "pyinstaller>=6.10,<7"
 python -m unittest
 pyinstaller --noconfirm --clean cr2app.spec
 ```
@@ -59,20 +59,22 @@ Tcl/Tk и сам Python у них общие, второй копии на 70 М
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m pip install pyinstaller
+python -m pip install "pyinstaller>=6.10,<7"
 python -m unittest
 pyinstaller --noconfirm --clean cr2app.spec
 ```
 
 Результат: `dist/CR2 Converter.app` (и рядом служебная папка `dist/CR2 Converter/`).
 
-**Важно про архитектуры.** У `rawpy` на PyPI есть колёса только под `macosx_11_0_arm64`.
-Ни x86_64, ни universal2 нет. Значит:
+**Важно про архитектуры.** Начиная с версии 0.26 `rawpy` публикует для macOS только
+колёса `macosx_11_0_arm64`: ни x86_64, ни universal2 у свежих версий нет. Значит:
 
-* на Apple Silicon (M1/M2/M3/M4) всё собирается штатно;
-* на Intel-маке `pip install rawpy` не найдёт колесо — либо собирайте LibRaw и rawpy
-  сами, либо живите без поддержки RAW через rawpy (остальной функционал работает,
-  rawpy импортируется лениво);
+* на Apple Silicon (M1/M2/M3/M4) всё собирается штатно и ставится последний `rawpy`;
+* на Intel-маке ставится `rawpy` ветки `<0.26` — это уже прописано в
+  `requirements.txt` тремя взаимоисключающими строками с маркерами окружения,
+  так что `pip install -r requirements.txt` сам выберет нужную. Ставить руками и
+  подбирать версию не надо. Если снять это ограничение, pip уйдёт собирать rawpy
+  из исходников, потребует LibRaw и упадёт;
 * `target_arch='universal2'` собрать нельзя — PyInstaller упадёт с
   `IncompatibleBinaryArchError`. Склеить два бандла через `lipo` тоже не выйдет:
   у каждой архитектурной части свой встроенный PKG-архив, и загрузчик найдёт только один.
@@ -104,20 +106,37 @@ ditto -c -k --sequesterRsrc --keepParent "dist/CR2 Converter.app" "CR2 Converter
 | `macos-latest`   | macOS arm64    | `CR2 Converter-<версия>-macos-arm64.zip`    |
 | `macos-15-intel` | macOS x86_64   | `CR2 Converter-<версия>-macos-x86_64.zip`   |
 
-На каждом раннере по шагам: checkout → Python 3.12 → установка `requirements.txt`
-и `pyinstaller` → **прогон всех тестов (`python -m unittest`)** → сборка по `.spec` →
-упаковка (Windows — zip папки onedir; macOS — `ditto -c -k --keepParent` бандла) →
-файл контрольных сумм SHA-256 → выгрузка артефакта.
+На каждом раннере по шагам:
+
+1. checkout, Python 3.12 (с кэшем загрузок pip по хешу `requirements.txt`);
+2. установка `requirements.txt` и `pyinstaller>=6.10,<7`;
+3. проверка, что `PIL`, `numpy`, `rawpy` реально **импортируются** (пакет может
+   встать и не импортироваться — доустановить его в готовый `.exe`/`.app`
+   пользователь уже не сможет);
+4. проверка, что Tk **открывает окно**;
+5. **прогон всех тестов — `python -m unittest`**;
+6. сборка по `.spec`, дымовой тест собранного CLI, на macOS — проверка `Info.plist`;
+7. упаковка (Windows — zip папки onedir; macOS — `ditto -c -k --keepParent` бандла);
+8. файл контрольных сумм SHA-256 и выгрузка артефакта.
 
 Если тесты падают — сборки не будет, задача помечается красным. Это намеренно:
 тесты стоят перед сборкой, а не после.
+
+Зачем отдельный шаг «Tk открывает окно», если тесты и так есть: тест сборки окна
+(`test_window_builds_and_closes`) при любой ошибке Tk вызывает `skipTest`. На машине
+разработчика это правильно, а в CI означало бы, что сломанный Tk **не красит сборку
+в красный** — единственный тест, который реально открывает окно, молча пропускается.
+Отдельный шаг превращает такой пропуск в честную ошибку.
 
 Примечание про `macos-15-intel`: образ `macos-13` снят с обслуживания 4 декабря 2025 года,
 `macos-15-intel` — штатная замена для x86_64. Intel-образы macOS вообще уходят
 примерно к осени 2027, так что Intel-ветка не навсегда.
 
-Второе примечание: на Intel-маке шаг установки зависимостей не уронит сборку из-за
-отсутствующего колеса `rawpy` — он поставит остальные пакеты и напишет предупреждение.
+Второе примечание: установка зависимостей **жёсткая** — любая неудача валит задачу.
+Раньше на Intel-маке она была снисходительной (ставила пакеты по одному и писала
+`::warning::`), и релиз получал ассет `-macos-x86_64.zip` без режима проявки RAW,
+внешне неотличимый от arm64. Теперь версия `rawpy` для Intel закреплена в
+`requirements.txt`, а любой сбой установки виден сразу.
 
 ---
 

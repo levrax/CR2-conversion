@@ -61,6 +61,17 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          # Кэшируется загрузочный кэш pip (колёса), а не site-packages:
+          # установка всё равно выполняется, но без похода в сеть и без сборки
+          # из исходников. Больше всего это экономит на macos-15-intel, где
+          # rawpy тянется старым колесом.
+          #
+          # ОСТОРОЖНО: `cache: pip` ищет **/requirements.txt (запасной вариант
+          # **/pyproject.toml) и ПАДАЕТ, если не нашёл ничего. Пока в корне
+          # лежит requirements.txt, шаг безопасен; при переименовании файла
+          # правьте и эту строку.
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       # Установка ЖЁСТКАЯ: никаких «поставим по одному и продолжим».
       # Раньше здесь был цикл, который при неудаче ставил пакеты по одному и
@@ -74,7 +85,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
+          # Верхняя граница не для красоты: в 7.0 PyInstaller обещает сделать
+          # ошибками то, что сейчас лишь предупреждения (например, onefile
+          # вместе с .app), и менять раскладку бандла. Незакреплённый
+          # `pip install pyinstaller` однажды сломает сборку в день выхода
+          # мажорной версии, без единой правки в репозитории.
+          python -m pip install 'pyinstaller>=6.10,<7'
           python -m pip list
 
       - name: Show toolchain
@@ -100,6 +116,29 @@ jobs:
               print("::error::в сборку не попадут: %s" % ", ".join(missing))
               sys.exit(1)
           print("PIL, numpy, rawpy - все импортируются")
+          PY
+
+      # test_window_builds_and_closes (test_cli_gui.py) при любой ошибке Tk
+      # вызывает self.skipTest - и это правильно для машины разработчика, но в
+      # CI означает, что сломанный Tk НЕ КРАСИТ сборку в красный: единственный
+      # тест, который реально собирает окно, молча пропускается, и так может
+      # продолжаться месяцами. На windows-latest есть оконная станция, на
+      # macOS-раннерах - настоящая сессия Aqua, так что окно обязано
+      # открываться на обеих платформах; если нет - это поломка, а не повод
+      # для пропуска.
+      - name: Assert Tk can actually open a window
+        run: |
+          python - <<'PY'
+          import sys, tkinter
+          try:
+              root = tkinter.Tk()
+          except BaseException as exc:
+              print("::error::Tk не работает (%s) - тесты GUI молча пропустятся" % exc)
+              sys.exit(1)
+          root.withdraw()
+          root.update()
+          root.destroy()
+          print("Tk", tkinter.TkVersion, "- окно открывается")
           PY
 
       # Тесты идут ДО сборки и валят задачу при любой ошибке.
