@@ -129,13 +129,17 @@ def native_error_dialog(title: str, text: str) -> bool:
 
     for cmd in cmds:
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=600, check=False)
-            return True
+            done = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=600,
+                                  check=False)
         except Exception:
-            # Нет такой программы (FileNotFoundError), нет дисплея, таймаут -
-            # пробуем следующую, молча.
+            # Нет такой программы (FileNotFoundError), таймаут - молча к
+            # следующей.
             continue
+        # Ненулевой код возврата - окно не показано (чаще всего нет дисплея),
+        # поэтому пробуем следующую программу, а не рапортуем об успехе.
+        if done.returncode == 0:
+            return True
     return False
 
 
@@ -443,11 +447,6 @@ def theme_honours_widget_colors(widget=None) -> bool:
         return str(ttk.Style(widget).theme_use()) != "aqua"
     except Exception:
         return True
-
-
-def fg(color: str, widget=None) -> dict:
-    """Параметры цвета текста для ttk-виджета: {} там, где тема их игнорирует."""
-    return {"foreground": color} if theme_honours_widget_colors(widget) else {}
 
 
 SETTINGS_PATH = settings_path()
@@ -1150,6 +1149,9 @@ class App(ttk.Frame):
         master.columnconfigure(0, weight=1)
 
         self.scale = ui_scale(master)
+        # Слушается ли тема цветов у ttk-виджетов (на macOS/aqua - нет).
+        # Считаем один раз: тему выбирает main() до сборки окна.
+        self._colors_ok = theme_honours_widget_colors(master)
         self.q: "queue.Queue" = queue.Queue()
         self.cancel_evt = threading.Event()
         self.thread: threading.Thread | None = None
@@ -1237,6 +1239,17 @@ class App(ttk.Frame):
     def _px(self, value: float) -> int:
         return int(round(value * self.scale))
 
+    def _fg(self, color: str) -> dict:
+        """Цвет текста для ttk-подписи: {} там, где тема его игнорирует.
+
+        Цвет здесь - только подсказка: смысл каждой такой подписи написан
+        словами, поэтому на macOS (тема aqua рисует виджеты сама и цвета не
+        принимает) ничего не теряется, а лишний игнорируемый параметр не
+        передаётся.  К раскраске строк таблицы это не относится: там цвета
+        живут в тегах Treeview и работают на всех системах.
+        """
+        return {"foreground": color} if self._colors_ok else {}
+
     def _build_ui(self) -> None:
         s = self.scale
         self.columnconfigure(0, weight=1)
@@ -1302,7 +1315,7 @@ class App(ttk.Frame):
                   "каждому файлу покажет кнопка «Проверить». Поворот требует "
                   "перекодирования; при\nуменьшении размера пересжимаются только "
                   "те файлы, которые больше заданного предела."),
-            foreground="#555555", justify="left")
+            justify="left", **self._fg("#555555"))
         hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, self._px(4)))
 
         ttk.Label(opt, text="Качество JPEG:").grid(row=2, column=0, sticky="w")
@@ -1358,13 +1371,14 @@ class App(ttk.Frame):
                   "нужны правки\nDPP — откройте файл в Canon Digital Photo "
                   "Professional и выполните «Конвертировать и сохранить»\n"
                   "или «Пакетная обработка»."),
-            foreground="#8a4b00", justify="left", wraplength=self._px(720))
+            justify="left", wraplength=self._px(720), **self._fg("#8a4b00"))
         self.dpp_note.grid(row=9, column=0, columnspan=3, sticky="w",
                            pady=(self._px(6), 0))
 
         self.hint_label = ttk.Label(opt, textvariable=self.hint_var,
-                                    foreground="#a05000", justify="left",
-                                    wraplength=self._px(720))
+                                    justify="left",
+                                    wraplength=self._px(720),
+                                    **self._fg("#a05000"))
         self.hint_label.grid(row=10, column=0, columnspan=3, sticky="w",
                              pady=(self._px(4), 0))
         row += 1
@@ -1412,11 +1426,11 @@ class App(ttk.Frame):
             variable=self.filter_var, command=self._on_filter_toggle)
         self.chk_filter.grid(row=0, column=0, sticky="w")
         ttk.Label(filt, textvariable=self.filter_info_var,
-                  foreground="#8a4b00").grid(row=0, column=1,
-                                             padx=(self._px(10), 0), sticky="w")
+                  **self._fg("#8a4b00")).grid(row=0, column=1,
+                                              padx=(self._px(10), 0), sticky="w")
         ttk.Label(filt, text="Щелчок по заголовку столбца сортирует таблицу.",
-                  foreground="#555555").grid(row=0, column=2,
-                                             padx=(self._px(10), 0), sticky="w")
+                  **self._fg("#555555")).grid(row=0, column=2,
+                                              padx=(self._px(10), 0), sticky="w")
         row += 1
 
         # --- 5. Таблица ------------------------------------------------------
@@ -2139,7 +2153,7 @@ class App(ttk.Frame):
         self.summary_var.set(text)
         try:
             self.summary_label.configure(
-                foreground="#8a4b00" if warn else "#14521f")
+                **self._fg("#8a4b00" if warn else "#14521f"))
             if text:
                 self.summary_label.grid()
             else:
