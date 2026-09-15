@@ -52,8 +52,11 @@ BUNDLE_ID = "com.cr2converter.app"
 ENTRY = ROOT / "app.py"
 GUI_PYW = ROOT / "cr2_gui.pyw"
 CORE = ROOT / "cr2_core.py"
+CLI_ENTRY = ROOT / "cr2_convert.py"
 
-for required in (ENTRY, GUI_PYW, CORE):
+APP_NAME_CLI = "%s CLI" % APP_NAME
+
+for required in (ENTRY, GUI_PYW, CORE, CLI_ENTRY):
     if not required.is_file():
         raise SystemExit("cr2app.spec: не найден обязательный файл %s" % required)
 
@@ -192,6 +195,39 @@ for _must in ("cr2_gui", "cr2_core"):
 pyz = PYZ(a.pure)
 
 # --------------------------------------------------------------------------
+# Второй вход: консольный cr2_convert.py
+# --------------------------------------------------------------------------
+# Окно (console=False) не имеет ни stdout, ни кода возврата, который увидит
+# скрипт, поэтому собранное приложение нечем проверить автоматически и нечем
+# встроить в чужой пакетный файл.  Рядом с окном кладётся консольный exe с той
+# же начинкой: он же служит дымовым тестом сборки (см. BUILD.md), он же даёт
+# пользователю пакетный режим без установки Python.
+#
+# Это ОТДЕЛЬНЫЙ Analysis, а не второй скрипт в первом: список скриптов внутри
+# одного Analysis PyInstaller склеивает и выполняет подряд в одном процессе.
+b = Analysis(
+    [str(CLI_ENTRY)],
+    pathex=[str(ROOT), str(ALIAS_DIR)],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=["cr2_core"],     # cr2_gui консольной версии не нужен
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=EXCLUDES,
+    noarchive=False,
+    optimize=0,
+)
+
+if "cr2_core" not in {name for name, _path, _typ in b.pure}:
+    raise SystemExit(
+        "cr2app.spec: cr2_core не попал в консольную сборку. Смотрите %s"
+        % (Path(workpath) / ("warn-%s.txt" % specnm))
+    )
+
+pyz_cli = PYZ(b.pure)
+
+# --------------------------------------------------------------------------
 # Исполняемый файл (onedir на обеих платформах)
 # --------------------------------------------------------------------------
 
@@ -227,10 +263,36 @@ exe = EXE(
     contents_directory="_internal",
 )
 
+exe_cli = EXE(
+    pyz_cli,
+    b.scripts,
+    [],
+    exclude_binaries=True,
+    name=APP_NAME_CLI,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,                      # смысл этого файла - вывод в консоль
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=os.environ.get("CODESIGN_IDENTITY") or None,
+    entitlements_file=None,
+    icon=ICON,
+    version=None,
+    contents_directory="_internal",
+)
+
+# Оба exe в одной папке: библиотеки, Tcl/Tk и питон у них общие, вторая копия
+# 70 МБ никому не нужна.  Совпадающие записи COLLECT отбрасывает сам.
 coll = COLLECT(
     exe,
+    exe_cli,
     a.binaries,
     a.datas,
+    b.binaries,
+    b.datas,
     strip=False,
     upx=False,
     upx_exclude=[],

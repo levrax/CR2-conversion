@@ -14,11 +14,32 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 python -m pip install pyinstaller
 python -m unittest
-pyinstaller --noconfirm --clean cr2_gui.spec
+pyinstaller --noconfirm --clean cr2app.spec
 ```
 
-Результат: `dist\CR2Converter\CR2Converter.exe` плюс папка `dist\CR2Converter\_internal\`
-(режим onedir, около 72 МБ). Раздавать надо **всю папку целиком**, а не только `.exe`.
+Результат — папка `dist\CR2 Converter\` (режим onedir, 74,3 МБ, 1022 файла), а в ней:
+
+| Файл | Что это |
+|------|---------|
+| `CR2 Converter.exe` | окно программы (5,4 МБ, без консоли) |
+| `CR2 Converter CLI.exe` | тот же конвертер в консоли (5,2 МБ), пакетный режим и дымовой тест сборки |
+| `_internal\` | Python 3.12, Tcl/Tk, Pillow, rawpy/LibRaw, numpy |
+
+Раздавать надо **всю папку целиком**, а не только `.exe`.
+
+Оба exe собираются из одной спеки двумя `Analysis` и кладутся в одну папку: библиотеки,
+Tcl/Tk и сам Python у них общие, второй копии на 70 МБ не появляется.
+
+Проверить готовую сборку, ничего не устанавливая:
+
+```bat
+"dist\CR2 Converter\CR2 Converter CLI.exe" --version
+```
+
+Должно напечатать `Pillow: есть, rawpy: есть` — это значит, что нативные библиотеки
+внутри бандла действительно грузятся. Консольный exe пишет в кодировке консоли
+(на русской Windows это cp866/cp1251), поэтому при перенаправлении в файл
+декодируйте соответственно.
 
 Почему onedir, а не один файл: замеры на этой машине дали запуск 0,23-0,32 с для onedir
 против 1,33-1,44 с для onefile. Onefile каждый раз распаковывает ~70 МБ во временную папку,
@@ -40,10 +61,10 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m pip install pyinstaller
 python -m unittest
-pyinstaller --noconfirm --clean cr2_gui.spec
+pyinstaller --noconfirm --clean cr2app.spec
 ```
 
-Результат: `dist/CR2Converter.app` (и рядом служебная папка `dist/CR2Converter/`).
+Результат: `dist/CR2 Converter.app` (и рядом служебная папка `dist/CR2 Converter/`).
 
 **Важно про архитектуры.** У `rawpy` на PyPI есть колёса только под `macosx_11_0_arm64`.
 Ни x86_64, ни universal2 нет. Значит:
@@ -59,7 +80,7 @@ pyinstaller --noconfirm --clean cr2_gui.spec
 Упаковывать `.app` нужно только через `ditto`, не через `zip`:
 
 ```bash
-ditto -c -k --sequesterRsrc --keepParent dist/CR2Converter.app CR2Converter.zip
+ditto -c -k --sequesterRsrc --keepParent "dist/CR2 Converter.app" "CR2 Converter.zip"
 ```
 
 Внутри `.app` есть симлинки и расширенные атрибуты с подписью — обычный `zip` их теряет,
@@ -79,9 +100,9 @@ ditto -c -k --sequesterRsrc --keepParent dist/CR2Converter.app CR2Converter.zip
 
 | Раннер           | Платформа      | Артефакт                                   |
 |------------------|----------------|--------------------------------------------|
-| `windows-latest` | Windows x64    | `CR2Converter-<версия>-windows-x64.zip`    |
-| `macos-latest`   | macOS arm64    | `CR2Converter-<версия>-macos-arm64.zip`    |
-| `macos-15-intel` | macOS x86_64   | `CR2Converter-<версия>-macos-x86_64.zip`   |
+| `windows-latest` | Windows x64    | `CR2 Converter-<версия>-windows-x64.zip`    |
+| `macos-latest`   | macOS arm64    | `CR2 Converter-<версия>-macos-arm64.zip`    |
+| `macos-15-intel` | macOS x86_64   | `CR2 Converter-<версия>-macos-x86_64.zip`   |
 
 На каждом раннере по шагам: checkout → Python 3.12 → установка `requirements.txt`
 и `pyinstaller` → **прогон всех тестов (`python -m unittest`)** → сборка по `.spec` →
@@ -156,7 +177,7 @@ git push origin v1.0.0
 Для тех, кому проще одной командой:
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/CR2Converter.app
+xattr -dr com.apple.quarantine "/Applications/CR2 Converter.app"
 ```
 
 Команду выполняет **получатель после скачивания** — на машине сборки она бессмысленна,

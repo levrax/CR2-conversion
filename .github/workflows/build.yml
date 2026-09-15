@@ -109,8 +109,8 @@ jobs:
       - name: Locate the .spec file
         id: spec
         run: |
-          if [ -f cr2_gui.spec ]; then
-            spec=cr2_gui.spec
+          if [ -f cr2app.spec ]; then
+            spec=cr2app.spec
           else
             spec="$(ls -1 *.spec 2>/dev/null | head -n 1)"
           fi
