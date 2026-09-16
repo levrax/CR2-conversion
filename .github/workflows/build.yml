@@ -122,9 +122,9 @@ jobs:
       - name: Verify runtime deps are importable
         run: |
           python - <<'PY'
-          import importlib, sys
+          import importlib, os, sys
           missing = []
-          for mod in ("PIL", "numpy", "rawpy"):
+          for mod in ("PIL", "numpy", "rawpy", "cv2"):
               try:
                   importlib.import_module(mod)
               except BaseException as exc:
@@ -132,7 +132,15 @@ jobs:
           if missing:
               print("::error::в сборку не попадут: %s" % ", ".join(missing))
               sys.exit(1)
-          print("PIL, numpy, rawpy - все импортируются")
+          # Каскад лиц лежит в самом колесе OpenCV; в opencv-python-headless
+          # 5.0 папка cv2/data пуста, и «Отбор» молча работал бы без лиц.
+          import cv2
+          cascade = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_alt2.xml")
+          if not os.path.isfile(cascade):
+              print("::error::в OpenCV %s нет каскада лиц %s" % (cv2.__version__, cascade))
+              sys.exit(1)
+          print("PIL, numpy, rawpy, cv2 %s - все импортируются, каскад лиц на месте"
+                % cv2.__version__)
           PY
 
       # test_window_builds_and_closes (test_cli_gui.py) при любой ошибке Tk
@@ -165,31 +173,49 @@ jobs:
       # публичном API проверок, тогда как сам лог задачи требует авторизации —
       # без этого падение CI выглядит как голое "exit code 1" и не
       # диагностируется вообще.
+      #
+      # Скрипт запуска - НАСТОЯЩИЙ ФАЙЛ, а не `python - <<PY`. При чтении из
+      # stdin у __main__ путь '<stdin>', и дочерние процессы пула (spawn -
+      # способ по умолчанию на Windows и macOS) падают, пытаясь заново
+      # выполнить '<cwd>/<stdin>'. cull.scan в этом случае молча доделывает
+      # разбор в потоках, и тесты пула процессов оставались зелёными, ничего
+      # не проверяя. Отсюда и `if __name__ == "__main__"`: дочерний процесс
+      # импортирует этот файл как __mp_main__ и не должен запускать тесты
+      # второй раз.
       - name: Run test suite
         run: |
-          python - <<'PY'
+          runner="$RUNNER_TEMP/run_tests.py"
+          cat > "$runner" <<'PY'
           import io, sys, unittest
 
-          buf = io.StringIO()
-          suite = unittest.TestLoader().discover('.', pattern='test_*.py',
-                                                 top_level_dir='.')
-          result = unittest.TextTestRunner(stream=buf, verbosity=2).run(suite)
-          sys.stdout.write(buf.getvalue())
 
-          if not result.wasSuccessful():
-              for kind, entries in (("FAIL", result.failures),
-                                    ("ERROR", result.errors)):
-                  for test, tb in entries:
-                      body = "%s: %s\n%s" % (kind, test, tb)
-                      body = body.replace("\r", "")[:2000]
-                      print("::error::" + body.replace("\n", "%0A"))
-              print("::error::%s: провалов %d, ошибок %d, всего тестов %d"
-                    % (sys.platform, len(result.failures), len(result.errors),
-                       result.testsRun))
-              sys.exit(1)
+          def main() -> int:
+              buf = io.StringIO()
+              suite = unittest.TestLoader().discover('.', pattern='test_*.py',
+                                                     top_level_dir='.')
+              result = unittest.TextTestRunner(stream=buf, verbosity=2).run(suite)
+              sys.stdout.write(buf.getvalue())
 
-          print("тестов пройдено: %d" % result.testsRun)
+              if not result.wasSuccessful():
+                  for kind, entries in (("FAIL", result.failures),
+                                        ("ERROR", result.errors)):
+                      for test, tb in entries:
+                          body = "%s: %s\n%s" % (kind, test, tb)
+                          body = body.replace("\r", "")[:2000]
+                          print("::error::" + body.replace("\n", "%0A"))
+                  print("::error::%s: провалов %d, ошибок %d, всего тестов %d"
+                        % (sys.platform, len(result.failures), len(result.errors),
+                           result.testsRun))
+                  return 1
+
+              print("тестов пройдено: %d" % result.testsRun)
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
           PY
+          python "$runner"
 
       - name: Resolve version
         id: ver
@@ -288,6 +314,41 @@ jobs:
               if m.group(1) in ("нет", "net"):
                   sys.exit("::error::%s отсутствует в собранном бандле "
                            "(вывод: %s)" % (dep, text.strip()))
+          PY
+
+      # Консольный exe выше собран из cr2_convert.py и о вкладках не знает.
+      # Вкладки проверяет само окно: с ключом --self-test (app.py) оно, не
+      # открываясь, импортирует gui_common, tab_*, enhance/cull/poster/brand,
+      # PIL/numpy/rawpy/cv2, ищет каскад лиц и шрифты fonts/ внутри бандла,
+      # прогоняет движки обработки и афиш на крошечных примерах и выходит с
+      # кодом 0/1.  Отчёт - файлом в UTF-8: у оконного exe на Windows нет stdout.
+      - name: Self-test the windowed app (tabs, OpenCV, fonts)
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            exe="dist/CR2 Converter/CR2 Converter.exe"
+          else
+            exe="dist/CR2 Converter.app/Contents/MacOS/CR2 Converter"
+          fi
+          python - "$exe" <<'PY'
+          import os, subprocess, sys, tempfile
+          report = os.path.join(tempfile.mkdtemp(), "selftest.txt")
+          try:
+              rc = subprocess.run([sys.argv[1], "--self-test", report],
+                                  timeout=300).returncode
+          except subprocess.TimeoutExpired:
+              print("::error::самопроверка бандла не завершилась за 300 с")
+              sys.exit(1)
+          try:
+              with open(report, encoding="utf-8") as f:
+                  text = f.read()
+          except OSError:
+              text = ""
+          sys.stdout.write(text)
+          if rc != 0 or not text:
+              failed = [ln for ln in text.splitlines() if ln.startswith("FAIL")]
+              print("::error::самопроверка бандла, код %d: %s"
+                    % (rc, "%0A".join(failed) or "отчёт не записан"))
+              sys.exit(1)
           PY
 
       # LSBackgroundOnly=true делает .app фоновым агентом: ни значка в Dock, ни

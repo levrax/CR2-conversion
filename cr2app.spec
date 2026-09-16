@@ -7,6 +7,11 @@
 Windows  ->  dist/CR2 Converter/CR2 Converter.exe  +  dist/CR2 Converter/_internal/
 macOS    ->  dist/CR2 Converter/  (сырой onedir)  и  dist/CR2 Converter.app
 
+Оконный exe - это всё приложение «Медиа-инструменты ЮИ РУДН»: конвертация и
+вкладки tab_enhance / tab_cull / tab_poster с движками enhance, cull, poster,
+brand.  Консольный - только конвертер (cr2_convert.py).  Проверить готовую
+сборку без окна:  "CR2 Converter.exe" --self-test отчёт.txt  (см. app.py).
+
 Помните: когда PyInstaller получает .spec, ВСЕ ключи командной строки, кроме
 --noconfirm, --clean, --distpath, --workpath, --upx-dir и --log-level,
 игнорируются.  Менять поведение сборки нужно здесь, а не флагами.
@@ -86,7 +91,11 @@ CLI_ENTRY = ROOT / "cr2_convert.py"
 
 APP_NAME_CLI = "%s CLI" % APP_NAME
 
-for required in (ENTRY, GUI_PYW, CORE, CLI_ENTRY):
+GUI_COMMON = ROOT / "gui_common.py"
+CULL = ROOT / "cull.py"
+FONTS_DIR = ROOT / "fonts"
+
+for required in (ENTRY, GUI_PYW, CORE, CLI_ENTRY, GUI_COMMON):
     if not required.is_file():
         raise SystemExit("cr2app.spec: не найден обязательный файл %s" % required)
 
@@ -178,6 +187,61 @@ binaries += _safe(collect_dynamic_libs, "PIL")
 # _tk_data сам и обрывает СБОРКУ, если не смог.
 datas += _safe(collect_data_files, "PIL")
 
+# --- Шрифты афиш: fonts/ -> <сборка>/fonts (poster.bundled_fonts_dir) -------
+#
+# Репозиторий публичный, а сборка - это распространение шрифта.  Поэтому в
+# сборку идёт не «всё из fonts/», а только шрифт, рядом с которым лежит его
+# лицензия <Семейство>-OFL.txt (SIL OFL разрешает распространение).  Шрифт без
+# лицензии останавливает сборку: так в релиз не уедет, например, Morfin Sans,
+# который кто-то положил в fonts/ для себя - его лицензия («Completely free
+# font») права распространять явно не даёт, и программа берёт его только из
+# папки шрифтов пользователя.
+_FONT_EXTS = (".ttf", ".otf")
+
+
+def _collect_fonts():
+    if not FONTS_DIR.is_dir():
+        if os.environ.get("CR2_REQUIRE_FULL_BUILD"):
+            raise SystemExit("cr2app.spec: нет папки %s - афиши в сборке "
+                             "остались бы без шрифтов." % FONTS_DIR)
+        print("cr2app.spec: папки fonts/ нет, шрифты не собраны")
+        return []
+    out = []
+    for font in sorted(FONTS_DIR.iterdir()):
+        if font.suffix.lower() not in _FONT_EXTS:
+            continue
+        if "morfin" in font.name.lower():
+            raise SystemExit(
+                "cr2app.spec: %s в fonts/.  Лицензия Morfin Sans не разрешает "
+                "распространение явно - такой шрифт в сборку не кладётся.  "
+                "Уберите файл из fonts/ (пользователь указывает его во "
+                "вкладке «Афиши»)." % font.name)
+        licence = FONTS_DIR / ("%s-OFL.txt" % font.stem.split("-")[0])
+        if not licence.is_file():
+            raise SystemExit(
+                "cr2app.spec: у шрифта %s нет файла лицензии %s.  Без лицензии, "
+                "разрешающей распространение, шрифт в сборку не кладётся."
+                % (font.name, licence.name))
+        out += [(str(font), "fonts"), (str(licence), "fonts")]
+    return sorted(set(out))
+
+
+datas += _collect_fonts()
+
+# --- OpenCV: каскад Хаара для поиска лиц во вкладке «Отбор» ------------------
+#
+# Хук cv2 из pyinstaller-hooks-contrib собирает модуль и его библиотеки, но
+# НЕ папку cv2/data с каскадами: cull тогда молча работал бы «без лиц».  Кладём
+# ровно тот файл, который читает cull.HAAR_FILE (все каскады вместе - почти 10 МБ).
+# Имя берём из cull.py текстом: импортировать cull здесь - значит тянуть numpy
+# в процесс спеки.
+_haar = re.search(r'^HAAR_FILE\s*=\s*"([^"]+)"', CULL.read_text(encoding="utf-8"),
+                  re.M) if CULL.is_file() else None
+HAAR_FILE = _haar.group(1) if _haar else None
+_cascade = (_safe(lambda pkg: collect_data_files(pkg, includes=["data/" + HAAR_FILE]),
+                  "cv2") if HAAR_FILE else [])
+datas += _cascade
+
 # Исходный .pyw кладём рядом как данные: это запасной путь загрузки в app.py
 # (load_gui ищет cr2_gui.pyw в _MEIPASS, если `import cr2_gui` не удался).
 datas += [(str(GUI_PYW), ".")]
@@ -189,6 +253,9 @@ datas += [(str(GUI_PYW), ".")]
 hiddenimports = [
     "cr2_gui",      # берётся из копии в _gui_alias, см. шапку
     "cr2_core",     # cr2_gui импортирует его после sys.path.insert
+    # Вкладки и их движки сюда НЕ вписаны: cr2_gui импортирует tab_* явными
+    # операторами import (см. _import_tab_module), анализатор их видит, а
+    # проверка ниже падает, если это когда-нибудь сломается.
 ]
 
 # --------------------------------------------------------------------------
@@ -272,6 +339,48 @@ def _require_runtime_deps(collected, which):
 
 
 _require_runtime_deps(_collected, "оконная часть")
+
+# Вкладки: из исходников любая может отсутствовать (оболочка покажет панель с
+# причиной), а выпуск без них - это другой продукт под тем же именем.
+TAB_GRAPH = ("gui_common", "tab_enhance", "tab_cull", "tab_poster",
+             "enhance", "cull", "poster", "brand", "cv2")
+# cv2 хук собирает в режиме module_collection_mode='py': его модули лежат в
+# сборке файлами .py (a.datas), а не в архиве PYZ (a.pure).
+_collected_as_files = {dest.replace("\\", "/").split("/")[0]
+                       for dest, _src, _typ in a.datas
+                       if dest.replace("\\", "/").endswith("/__init__.py")}
+if REQUIRE_FULL:
+    _lost = [m for m in TAB_GRAPH
+             if m not in _collected and m not in _collected_as_files]
+    if _lost:
+        raise SystemExit(
+            "cr2app.spec: в сборку не попали модули вкладок: %s.\n"
+            "python -m pip install -r requirements.txt\nПодробности: %s"
+            % (", ".join(_lost), Path(workpath) / ("warn-%s.txt" % specnm)))
+    # opencv-python / opencv-contrib-python пишут в ту же папку cv2/, что и
+    # -headless: в сборку уедет файл того, кто ставился последним, и проверка
+    # каскада ниже этого не заметит (каскады есть у всех трёх).
+    from importlib import metadata as _metadata
+    _cv2_dists = sorted(set(_metadata.packages_distributions().get("cv2", ())))
+    _foreign_cv2 = [d for d in _cv2_dists
+                    if d.lower().replace("_", "-") != "opencv-python-headless"]
+    if _foreign_cv2:
+        raise SystemExit(
+            "cr2app.spec: кроме opencv-python-headless в окружении стоит %s - "
+            "какой из них cv2 в сборке, решил порядок установки.  Соберите в "
+            "чистом venv:  python -m pip install -r requirements.txt"
+            % ", ".join(_foreign_cv2))
+    if not _cascade:
+        raise SystemExit(
+            "cr2app.spec: в пакете cv2 нет каскада %s - поиск лиц в сборке не "
+            "работал бы.  Нужен opencv-python-headless<5 (см. requirements.txt)."
+            % HAAR_FILE)
+
+# OpenCV-плагин видео на FFmpeg (opencv_videoio_ffmpeg*.dll, 30 МБ).  Хук cv2
+# собирает его как библиотеку, но это подгружаемый по требованию модуль
+# cv2.VideoCapture: программа видео не открывает, а cv2.pyd от него не зависит.
+a.binaries = [entry for entry in a.binaries
+              if not os.path.basename(entry[0]).lower().startswith("opencv_videoio_ffmpeg")]
 
 pyz = PYZ(a.pure)
 
@@ -361,7 +470,7 @@ if IS_WIN:
         )
 
     VERSION_GUI = _win_version_resource(
-        APP_NAME, "Конвертер CR2 в JPEG без потерь")
+        APP_NAME, "Медиа-инструменты ЮИ РУДН")
     VERSION_CLI = _win_version_resource(
         APP_NAME_CLI, "Конвертер CR2 в JPEG без потерь (консоль)")
 
@@ -475,7 +584,41 @@ coll = COLLECT(
 # macOS: настоящий .app
 # --------------------------------------------------------------------------
 
+# LSMinimumSystemVersion: не выдуманная цифра, а самая новая macOS, под которую
+# собраны вложенные нативные библиотеки.  Колёса OpenCV 4.13+ есть только как
+# macosx_13_0_arm64 и macosx_14_0_x86_64, numpy 2.5 на macOS 14+ ставится из
+# macosx_14_0_*.  Зашитое «11.0» пускало бы .app на систему, где cv2.so или
+# numpy не загрузятся: окно открылось бы, а вкладки показали бы панель ошибки.
+# Берём из тегов колёс, которые реально стоят в окружении сборки.
+MACOS_FLOOR = (11, 0)      # ниже не поддерживает сам Python 3.12 с python.org
+
+
+def _macos_minimum():
+    import platform
+    from importlib import metadata
+    arch = platform.machine()
+    tag_re = re.compile(r"macosx_(\d+)_(\d+)_(\w+)")
+    by_module = metadata.packages_distributions()
+    need = MACOS_FLOOR
+    for module in ("PIL", "numpy", "rawpy", "cv2"):
+        for dist_name in by_module.get(module, ()):
+            try:
+                wheel = metadata.distribution(dist_name).read_text("WHEEL") or ""
+            except Exception:           # noqa: BLE001 - нет метаданных: не знаем
+                continue
+            # Колесо с несколькими тегами годится для самого старого из них.
+            found = [(int(m.group(1)), int(m.group(2)))
+                     for m in tag_re.finditer(wheel)
+                     if m.group(3) in (arch, "universal2")]
+            if found and min(found) > need:
+                need = min(found)
+                print("cr2app.spec: %s (%s) требует macOS %d.%d"
+                      % (dist_name, module, need[0], need[1]))
+    return "%d.%d" % need
+
+
 if IS_MAC:
+    MACOS_MINIMUM = _macos_minimum()
     app = BUNDLE(
         coll,                          # именно COLLECT: onefile + .app не бывает
         name="%s.app" % APP_NAME,
@@ -505,7 +648,7 @@ if IS_MAC:
             # По документации необходим, чтобы окно рисовалось в retina.
             "NSPrincipalClass": "NSApplication",
             "NSRequiresAquaSystemAppearance": False,   # разрешить тёмную тему
-            "LSMinimumSystemVersion": "11.0",
+            "LSMinimumSystemVersion": MACOS_MINIMUM,
             "LSApplicationCategoryType": "public.app-category.photography",
             "NSHumanReadableCopyright": "CR2 Converter",
         },

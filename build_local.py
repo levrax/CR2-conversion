@@ -127,7 +127,8 @@ def preflight() -> int:
     say("Папка       : %s" % ROOT)
 
     for name in ("app.py", "cr2app.spec", "cr2_gui.pyw", "cr2_core.py",
-                 "cr2_convert.py"):          # cr2_convert.py — вход для CLI-exe
+                 "cr2_convert.py",           # cr2_convert.py — вход для CLI-exe
+                 "gui_common.py"):           # без него окно без вкладок
         if not (ROOT / name).is_file():
             say("НЕТ ФАЙЛА   : %s" % name)
             problems += 1
@@ -152,9 +153,10 @@ def preflight() -> int:
     # Поэтому это ПРОБЛЕМА, а не заметка: раньше скрипт печатал «в сборке
     # пропадёт режим …», тут же сообщал «Проверка пройдена» и возвращал 0,
     # то есть спокойно выпускал дистрибутив с половиной возможностей.
-    for mod, why in (("PIL", "поворот и уменьшение"),
-                     ("numpy", "нужен rawpy"),
-                     ("rawpy", "проявка RAW без встроенного JPEG")):
+    for mod, why in (("PIL", "поворот и уменьшение, все вкладки"),
+                     ("numpy", "нужен rawpy и вкладкам"),
+                     ("rawpy", "проявка RAW без встроенного JPEG"),
+                     ("cv2", "поиск лиц во вкладке «Отбор»")):
         try:
             __import__(mod)
             say("%-12s: есть" % mod)
@@ -275,6 +277,42 @@ def check_macos_plist(app: Path) -> int:
     return bad
 
 
+def self_test(exe: Path) -> int:
+    """Запустить собранное окно с --self-test (см. app.py) и показать отчёт.
+
+    Окно при этом не открывается: приложение импортирует всё, что нужно
+    вкладкам, прогоняет движки на крошечных примерах и выходит.  Отчёт - в
+    build/selftest.txt (у оконного exe на Windows нет stdout).
+    """
+    if not exe.is_file():
+        return 0                        # отсутствие файла уже показал report()
+    out = ROOT / "build" / "selftest.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        out.unlink()
+    except OSError:
+        pass
+    say()
+    say("Самопроверка: \"%s\" --self-test" % exe)
+    try:
+        rc = subprocess.call([str(exe), "--self-test", str(out)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        say("    не запустилась: %s" % exc)
+        return 1
+    try:
+        text = out.read_text(encoding="utf-8")
+    except OSError:
+        text = "(отчёт не записан)\n"
+    for line in text.splitlines():
+        say("    " + line)
+    if rc != 0:
+        say("Самопроверка провалена (код %d): в сборке чего-то не хватает." % rc)
+        return 1
+    return 0
+
+
 def report() -> int:
     """Что получилось. Возвращает 0, если ожидаемый результат на месте."""
     dist = ROOT / "dist"
@@ -322,6 +360,11 @@ def report() -> int:
         bad = check_macos_plist(dist / ("%s.app" % APP_NAME))
         if bad:
             return bad
+
+    bad = self_test(main_dir / ("%s.exe" % APP_NAME) if IS_WIN else
+                    dist / ("%s.app" % APP_NAME) / "Contents" / "MacOS" / APP_NAME)
+    if bad:
+        return bad
 
     say()
     if IS_WIN:

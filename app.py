@@ -7,7 +7,9 @@
 2) ставит перехватчики аварий раньше, чем что-либо успеет упасть,
 3) в замороженной сборке уводит настройки и журнал ошибок туда, куда
    пользователю действительно можно писать,
-4) вызывает cr2_gui.main().
+4) вызывает cr2_gui.main(),
+5) с ключом --self-test вместо окна проверяет, что в сборку попало всё
+   для всех вкладок (см. self_test; им пользуется дымовой тест CI).
 
 ЗАЧЕМ ДВА ПУТИ ЗАГРУЗКИ.  Расширение .pyw импортируется по-разному на разных
 системах: importlib добавляет '.pyw' в SOURCE_SUFFIXES ТОЛЬКО на Windows
@@ -283,6 +285,146 @@ def load_gui():
 
 
 # --------------------------------------------------------------------------
+# Самопроверка собранного приложения (без окна)
+# --------------------------------------------------------------------------
+#
+# Оконный exe не печатает ничего, а консольный собран из другого графа
+# импортов (cr2_convert.py) и о вкладках не знает вовсе.  Поэтому дымовой тест
+# CI запускает САМО окно с ключом --self-test: оно импортирует всё, что должно
+# было попасть в сборку, прогоняет по крошечному примеру через каждый движок и
+# выходит с кодом 0 или 1.  Отчёт пишется в файл (у оконного exe на Windows
+# stdout нет) и, если есть куда, в stdout.  Окно Tk при этом не создаётся.
+
+SELF_TEST_FLAG = "--self-test"
+
+#: Модули, без которых сборка неполна.  Порядок - порядок отчёта.
+SELF_TEST_MODULES: tuple[str, ...] = (
+    "cr2_core", "cr2_gui", "gui_common",
+    "enhance", "cull", "brand", "poster",
+    "tab_enhance", "tab_cull", "tab_poster",
+    "PIL", "numpy", "rawpy", "cv2",
+)
+
+
+def _import_for_self_test(name: str):
+    """Импорт без _fatal: самопроверка сообщает об ошибке, а не показывает окно."""
+    import importlib
+    if name != GUI_MODULE:
+        return importlib.import_module(name)
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
+    # Исходники на macOS и Linux: .pyw по имени не импортируется.
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    path = _source_dir() / GUI_SOURCE
+    spec = importlib.util.spec_from_file_location(
+        name, str(path), loader=SourceFileLoader(name, str(path)))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def self_test(report_path: str | None = None) -> int:
+    """Проверить, что в приложении есть всё для всех вкладок.  0 - да, 1 - нет.
+
+    Проверяется то, что ломается именно при сборке: модуль не попал в граф,
+    нет файла каскада лиц OpenCV, нет папки fonts/, у нативной библиотеки не
+    загрузилась зависимость.  Каждая проверка независима: одна упавшая не
+    скрывает остальные.
+    """
+    base = _source_dir()
+    if str(base) not in sys.path:
+        sys.path.insert(0, str(base))
+    lines: list[str] = ["%s %s, frozen=%s, %s" % (APP_TITLE, SELF_TEST_FLAG,
+                                                  IS_FROZEN, sys.platform)]
+    failed = 0
+
+    def check(name: str, fn) -> None:
+        nonlocal failed
+        try:
+            detail = fn()
+        except BaseException as exc:                # noqa: BLE001 - это отчёт
+            failed += 1
+            lines.append("FAIL  %s: %s: %s" % (name, type(exc).__name__, exc))
+        else:
+            lines.append("ok    %s%s" % (name, ": %s" % detail if detail else ""))
+
+    for mod_name in SELF_TEST_MODULES:
+        check("import " + mod_name,
+              lambda m=mod_name: str(getattr(_import_for_self_test(m),
+                                             "__version__", "") or ""))
+
+    def faces() -> str:
+        import cull
+        mode, note = cull.face_backend()
+        if mode != cull.MODE_FACES:
+            raise RuntimeError("режим «%s»: %s" % (mode, note))
+        return note
+
+    def fonts() -> str:
+        import poster
+        folder = poster.bundled_fonts_dir()
+        missing = [f for f in poster._BUNDLED_FILES.values()     # noqa: SLF001
+                   if not (folder / f).is_file()]
+        if missing:
+            raise FileNotFoundError("нет в %s: %s" % (folder, ", ".join(missing)))
+        if IS_FROZEN and Path(getattr(sys, "_MEIPASS", "")) not in folder.parents:
+            raise RuntimeError("папка шрифтов не внутри сборки: %s" % folder)
+        return str(folder)
+
+    def enhance_engine() -> str:
+        import enhance
+        from PIL import Image
+        src = Image.new("RGB", (64, 48), (40, 30, 25))
+        out = enhance.preview(src, None)
+        if out.size != src.size or out.getpixel((10, 10)) == src.getpixel((10, 10)):
+            raise RuntimeError("предпросмотр не изменил тёмный кадр")
+        return "%dx%d" % out.size
+
+    def poster_engine() -> str:
+        import poster
+        tid = poster.list_templates()[0][0]
+        img = poster.render(tid, poster.example_fields(tid), None, size=(216, 270))
+        report = poster.render_report(img)
+        used = ", ".join(f.label for f in (report.fonts.values() if report else ()))
+        return "%s %dx%d, %s" % (tid, img.size[0], img.size[1], used)
+
+    def tk_runtime() -> str:
+        import tkinter
+        return "Tcl/Tk %s" % tkinter.TkVersion
+
+    check("поиск лиц (OpenCV)", faces)
+    check("шрифты fonts/", fonts)
+    check("движок обработки", enhance_engine)
+    check("движок афиш", poster_engine)
+    check("tkinter", tk_runtime)
+    lines.append("итог: %s" % ("всё на месте" if not failed
+                               else "провалено проверок: %d" % failed))
+
+    text = "\n".join(lines) + "\n"
+    if report_path:
+        try:
+            Path(report_path).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            failed += 1
+            text += "не удалось записать отчёт %s: %s\n" % (report_path, exc)
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except Exception:
+        pass
+    return 1 if failed else 0
+
+
+# --------------------------------------------------------------------------
 # Точка входа
 # --------------------------------------------------------------------------
 
@@ -323,4 +465,18 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # freeze_support() - ПЕРВЫМ делом, до load_gui() и до любого тяжёлого
+    # импорта (tkinter, Pillow, numpy, cv2 во вкладках).  Причина: вкладки
+    # вправе раздавать работу ProcessPoolExecutor/multiprocessing, а в
+    # собранном приложении дочерний процесс - это тот же самый .exe, запущенный
+    # с особыми аргументами.  Только freeze_support() узнаёт такой запуск и
+    # превращает процесс в рабочий; без неё дочерний процесс проходит мимо и
+    # открывает ЕЩЁ ОДНО окно программы, а оно - своих детей: на Windows .exe
+    # перезапускает себя бесконечно.  PyInstaller подменяет эту функцию так,
+    # что она работает и в .app на macOS (там дети тоже запускаются через
+    # spawn).  В обычном запуске из исходников вызов ничего не делает.
+    import multiprocessing
+    multiprocessing.freeze_support()
+    if len(sys.argv) >= 2 and sys.argv[1] == SELF_TEST_FLAG:
+        sys.exit(self_test(sys.argv[2] if len(sys.argv) >= 3 else None))
     sys.exit(main())
