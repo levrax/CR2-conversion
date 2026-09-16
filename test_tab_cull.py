@@ -490,8 +490,15 @@ class TestTab(_Base):
                              and not self.tab.is_building))
         self.assertEqual(len(self.tab.cards), len(self.result.bursts))
         self.assertIn("Режим: без лиц", self.tab.mode_var.get())
-        # Миниатюры пришли из самого разбора - отдельного чтения файлов не нужно.
-        self.assertFalse(self.tab.thumbs_pending)
+        # Миниатюры пришли из самого разбора - отдельного чтения файлов не нужно:
+        # фоновое чтение не ставилось в очередь вовсе.  Это детерминировано.
+        self.assertFalse(self.tab._thumb_queue)  # noqa: SLF001
+        self.assertIsNone(self.tab._thumb_job)  # noqa: SLF001
+        # А обёртка в PhotoImage идёт пачками через after() и на медленной машине
+        # (раннер CI) к этому моменту может ещё не закончиться.  Раньше здесь была
+        # мгновенная проверка thumbs_pending - на ноутбуке она проходила, а на
+        # windows-latest падала.  Завершение дожидаемся, а не проверяем сразу.
+        self.assertTrue(pump(self.root, lambda: not self.tab.thumbs_pending))
         self.assertEqual(self.settings["tabs"]["cull"]["folder"], str(self.photos))
         self.assertEqual(snapshot(self.photos), before)
 

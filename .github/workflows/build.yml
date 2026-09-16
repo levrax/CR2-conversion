@@ -186,15 +186,70 @@ jobs:
         run: |
           runner="$RUNNER_TEMP/run_tests.py"
           cat > "$runner" <<'PY'
-          import io, sys, unittest
+          import faulthandler, os, sys, tempfile, threading, time, unittest
+
+          # Зависание в CI без этого не диагностируется вовсе: лог задачи закрыт
+          # без авторизации, а при таймауте job не остаётся ни одной аннотации.
+          HANG_MINUTES = 15
+          DIALOGS = []
+
+
+          def _no_modal(name):
+              # Модальное окно в тесте ждёт нажатия вечно.  Вместо зависания -
+              # немедленная ошибка с текстом окна (часто это и есть причина).
+              def refuse(*args, **kwargs):
+                  text = "%s%r" % (name, tuple(str(a)[:300] for a in args[:2]))
+                  DIALOGS.append((Tracking.current, text))
+                  raise AssertionError("модальное окно в тесте: " + text)
+              return refuse
+
+
+          def _block_dialogs():
+              try:
+                  import tkinter.filedialog as fd
+                  import tkinter.messagebox as mb
+              except Exception:
+                  return
+              for n in ("showinfo", "showwarning", "showerror", "askquestion",
+                        "askokcancel", "askyesno", "askyesnocancel", "askretrycancel"):
+                  setattr(mb, n, _no_modal("messagebox." + n))
+              for n in ("askdirectory", "askopenfilename", "askopenfilenames",
+                        "asksaveasfilename", "askopenfile", "asksaveasfile"):
+                  setattr(fd, n, _no_modal("filedialog." + n))
+
+
+          class Tracking(unittest.TextTestResult):
+              current = "(тесты ещё не начались)"
+
+              def startTest(self, test):
+                  Tracking.current = str(test)
+                  super().startTest(test)
+
+
+          def _watchdog():
+              time.sleep(HANG_MINUTES * 60)
+              with tempfile.TemporaryFile("w+") as dump:
+                  faulthandler.dump_traceback(file=dump, all_threads=True)
+                  dump.seek(0)
+                  stacks = dump.read()[-1800:]
+              print("::error::%s: тесты не закончились за %d мин, завис на: %s%%0A%s"
+                    % (sys.platform, HANG_MINUTES, Tracking.current,
+                       stacks.replace("\r", "").replace("\n", "%0A")), flush=True)
+              for where, text in DIALOGS:
+                  print("::error::диалог в %s: %s" % (where, text), flush=True)
+              os._exit(1)
 
 
           def main() -> int:
-              buf = io.StringIO()
+              _block_dialogs()
+              threading.Thread(target=_watchdog, daemon=True).start()
               suite = unittest.TestLoader().discover('.', pattern='test_*.py',
                                                      top_level_dir='.')
-              result = unittest.TextTestRunner(stream=buf, verbosity=2).run(suite)
-              sys.stdout.write(buf.getvalue())
+              # Вывод идёт сразу в лог, а не копится до конца: видно, на чём встало.
+              result = unittest.TextTestRunner(stream=sys.stdout, verbosity=2,
+                                               resultclass=Tracking).run(suite)
+              for where, text in DIALOGS:
+                  print("::error::диалог в %s: %s" % (where, text))
 
               if not result.wasSuccessful():
                   for kind, entries in (("FAIL", result.failures),
