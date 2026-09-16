@@ -30,8 +30,10 @@
 
 from __future__ import annotations
 
+import copy
 import ctypes
 import datetime
+import importlib
 import json
 import os
 import queue
@@ -874,6 +876,11 @@ DEFAULT_SETTINGS: dict = {
     "prefer_dpp_preview": False,
     "show_log": False,
     "last_file_dir": "",
+    # Оболочка с вкладками.  "tabs" - настройки вкладок по именам
+    # ({"enhance": {...}, "cull": {...}}), их выдаёт AppContext.tab_settings();
+    # "last_tab" - ключ вкладки, открытой при прошлом закрытии окна.
+    "tabs": {},
+    "last_tab": "",
 }
 
 
@@ -929,7 +936,10 @@ def _read_settings_text() -> str:
 
 def load_settings() -> dict:
     """Прочитать настройки. Битый файл не теряем, а отводим в сторону."""
-    data = dict(DEFAULT_SETTINGS)
+    # deepcopy, а не dict(): иначе "tabs" у всех загрузок был бы ОДНИМ И ТЕМ
+    # ЖЕ словарём из DEFAULT_SETTINGS, и настройки вкладок протекали бы в
+    # умолчания.
+    data = copy.deepcopy(DEFAULT_SETTINGS)
     if not SETTINGS_PATH.exists():
         return data
     try:
@@ -950,6 +960,14 @@ def load_settings() -> dict:
         val = raw.get(key, default)
         if val is None:
             continue                      # явный null == «взять умолчание»
+        if isinstance(default, dict):
+            # Только словарь словарей: чужой тип одной вкладки не должен
+            # сбрасывать настройки остальных, а строка вместо словаря -
+            # превращаться в настройки вообще.
+            if isinstance(val, dict):
+                data[key] = {str(k): v for k, v in val.items()
+                             if isinstance(v, dict)}
+            continue
         if isinstance(default, bool):
             data[key] = bool(val)
         elif isinstance(default, int):
@@ -979,7 +997,10 @@ def save_settings(data: dict) -> None:
         # чтобы простой запуск программы не оставлял следов в системе.
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            # default=str: значение, которое JSON не умеет (Path из настроек
+            # вкладки), раньше роняло dump на полпути - и молча терялись
+            # ВСЕ настройки, а не одно значение.
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, SETTINGS_PATH)
@@ -1438,9 +1459,17 @@ CR2_TYPES = [("Файлы Canon RAW", ("*.cr2", "*.CR2")), ("Все файлы",
 
 
 class App(ttk.Frame):
-    def __init__(self, master: tk.Tk) -> None:
+    """Вкладка «Конвертация».  Работает и прямо в корневом окне, и во вкладке.
+
+    master - любой контейнер (tk.Tk или фрейм вкладки); окно, которое
+    закрывается в on_close, находится через winfo_toplevel().  settings -
+    общий словарь настроек оболочки: тогда App записывает его ЦЕЛИКОМ и не
+    теряет настройки других вкладок.  Без него App читает файл сам, как раньше.
+    """
+
+    def __init__(self, master: tk.Misc, settings: dict | None = None) -> None:
         super().__init__(master, padding=(10, 8))
-        self.master_root = master
+        self.master_root = master.winfo_toplevel()
         self.grid(row=0, column=0, sticky="nsew")
         master.rowconfigure(0, weight=1)
         master.columnconfigure(0, weight=1)
@@ -1452,7 +1481,7 @@ class App(ttk.Frame):
         self.running = False
         self.probe_only = False
 
-        self.settings = load_settings()
+        self.settings = settings if settings is not None else load_settings()
         self.caps_pillow: bool | None = None
         self.caps_rawpy: bool | None = None
         self._pillow_warned = False
@@ -1504,6 +1533,12 @@ class App(ttk.Frame):
             record_error("caps", traceback.format_exc())
             self.caps_pillow = self.caps_rawpy = False
         self._poll_id = self.after(POLL_MS, self._poll)
+        # Окно могут закрыть и в обход _destroy (root.destroy() в тесте или в
+        # оболочке).  Таймер _poll при этом остаётся в очереди событий Tcl
+        # потока, а его команда удаляется вместе с виджетом, и следующий
+        # update() ЛЮБОГО окна в этом потоке печатает «invalid command name
+        # ..._poll».  Снимаем таймер в момент разрушения.
+        self.bind("<Destroy>", self._on_destroy_event, add="+")
 
     # ---------------- переменные ----------------
 
@@ -2329,9 +2364,16 @@ class App(ttk.Frame):
                 except tk.TclError:
                     pass
                 self._tree_tail = None
-            if not self._destroyed:
+            if not self._destroyed and self._alive():
                 # цикл перезапускает сам себя и живёт всё время работы окна
                 self._poll_id = self.after(POLL_MS, self._poll)
+
+    def _alive(self) -> bool:
+        """Виджет ещё существует (его могли разрушить внутри _handle)."""
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _handle(self, msg) -> None:
         if isinstance(msg, MProgress):
@@ -2688,7 +2730,9 @@ class App(ttk.Frame):
             "last_file_dir": self.settings.get("last_file_dir", ""),
         }
         self.settings.update(data)
-        save_settings(data)
+        # Весь словарь, а не только ключи конвертера: в нём же лежат "tabs" и
+        # "last_tab", и запись одного data стирала бы настройки вкладок.
+        save_settings(self.settings)
 
     # ---------------- закрытие окна ----------------
 
@@ -2747,6 +2791,16 @@ class App(ttk.Frame):
                 os._exit(0)
         self._destroy()
 
+    def _on_destroy_event(self, event: tk.Event) -> None:
+        """<Destroy> самой вкладки (не дочерних виджетов): снять цикл опроса."""
+        if event.widget is not self or self._poll_id is None:
+            return
+        try:
+            self.after_cancel(self._poll_id)
+        except Exception:
+            pass
+        self._poll_id = None
+
     def _destroy(self) -> None:
         # Снимаем всё, что Tk мог бы вызвать уже после разрушения окна:
         # незавершённый after-цикл и внутренний таймер индикатора прогресса.
@@ -2770,8 +2824,447 @@ class App(ttk.Frame):
 
 
 # --------------------------------------------------------------------------
+# Оболочка с вкладками
+# --------------------------------------------------------------------------
+#
+# Окно - это ttk.Notebook.  Первая вкладка «Конвертация» - прежний App без
+# единого изменения в поведении.  Остальные - необязательные модули, которые
+# оболочка ищет по именам из TAB_MODULES.  Контракт модуля вкладки:
+#
+#     TAB_TITLE: str
+#     def build_tab(parent: ttk.Notebook, ctx: gui_common.AppContext) -> ttk.Frame
+#
+# Модуля нет - вкладки нет, и это не ошибка.  Модуль упал при импорте или в
+# build_tab - вместо вкладки панель с объяснением по-русски, запись в журнал
+# ошибок, а остальная программа работает.  Добавить вкладку = положить файл
+# рядом; сам cr2_gui.pyw при этом не правится.
+# --------------------------------------------------------------------------
+
+try:
+    import gui_common  # noqa: E402  (лежит рядом, как cr2_core)
+    _GUI_COMMON_ERROR = ""
+except Exception:                       # скопировали не всю папку
+    gui_common = None                   # type: ignore[assignment]
+    _GUI_COMMON_ERROR = traceback.format_exc()
+
+#: Модули вкладок в порядке показа - в порядке работы со съёмкой: сначала
+#: «Отбор» (отметить лучшие кадры), потом «Обработка» (она берёт отмеченные),
+#: потом «Афиши».  Слева направо вкладки и читаются как шаги.
+TAB_MODULES: tuple[str, ...] = ("tab_cull", "tab_enhance", "tab_poster")
+#: Подписи для панели ошибки, когда модуль упал раньше, чем объявил TAB_TITLE.
+#: Совпадают с TAB_TITLE самих модулей (это проверяет test_shell).
+_TAB_FALLBACK_TITLES = {"tab_enhance": "Обработка", "tab_cull": "Отбор",
+                        "tab_poster": "Афиши"}
+CONVERT_TAB_KEY = "convert"
+CONVERT_TAB_TITLE = "Конвертация"
+#: Библиотека, которой нет -> что ставить.  Для подсказки на панели ошибки.
+_PIP_NAMES = {"cv2": "opencv-python", "PIL": "Pillow", "numpy": "numpy",
+              "rawpy": "rawpy", "fitz": "PyMuPDF"}
+
+
+class TabContractError(Exception):
+    """Модуль вкладки не выполняет контракт (нет TAB_TITLE, build_tab ...)."""
+
+
+def _import_tab_module(name: str):
+    """Импортировать модуль вкладки.  None - такого модуля нет вовсе.
+
+    Операторы import написаны явно, а не importlib.import_module(name):
+    анализатор PyInstaller видит только их, и вкладка, подключённая строкой,
+    молча не попала бы в собранное приложение.  Отсутствие САМОГО модуля -
+    не ошибка; а вот ModuleNotFoundError про чужое имя (внутри вкладки нет
+    cv2) - ошибка, и пользователь должен её увидеть.
+    """
+    try:
+        if name == "tab_enhance":
+            import tab_enhance as module          # noqa: F401
+        elif name == "tab_cull":
+            import tab_cull as module             # noqa: F401
+        elif name == "tab_poster":
+            import tab_poster as module           # noqa: F401
+        else:
+            module = importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name == name:
+            return None
+        raise
+    return module
+
+
+@dataclass
+class TabRecord:
+    """Одна вкладка блокнота."""
+    key: str             # "convert", "enhance", ... - хранится в last_tab
+    title: str
+    frame: object        # виджет, добавленный в блокнот
+    error: str = ""      # непустая строка == вместо вкладки панель ошибки
+
+
+class Shell:
+    """Главное окно: блокнот вкладок, строка состояния, закрытие.
+
+    Собирается в потоке Tk.  root - корневое окно; settings - общий словарь
+    настроек (по умолчанию читается из файла); tab_modules - имена модулей
+    вкладок (тесты подставляют свои).
+    """
+
+    def __init__(self, root: tk.Tk, settings: dict | None = None,
+                 tab_modules: tuple[str, ...] | list[str] = TAB_MODULES) -> None:
+        if gui_common is None:
+            raise RuntimeError("не загружен gui_common:\n%s" % _GUI_COMMON_ERROR)
+        self.root = root
+        self.settings = settings if settings is not None else load_settings()
+        self._closing = False
+        self._close_deadline = 0.0
+        self.tabs: list[TabRecord] = []
+        self.app: App | None = None
+        self.ctx = gui_common.AppContext(
+            root, settings=self.settings,
+            # Лямбды, а не сами функции: app.py и тесты подменяют SETTINGS_PATH
+            # и ERROR_LOG_PATH модуля, а обёртка гарантирует, что вызов пойдёт
+            # через модульные имена в момент вызова, а не через снимок сейчас.
+            save_settings=lambda data: save_settings(data),
+            record_error=lambda where, text: record_error(where, text),
+            reveal=lambda target: reveal_in_file_manager(target),
+            scale=ui_scale(root))
+
+        root.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+        self.notebook = ttk.Notebook(root)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.status_var = tk.StringVar(value="")
+        self.status = ttk.Label(root, textvariable=self.status_var, anchor="w",
+                                padding=(10, 2, 10, 4))
+        self.status.grid(row=1, column=0, sticky="ew")
+        self.ctx.subscribe(gui_common.TOPIC_LOG, self._on_log)
+
+        self._build_convert_tab()
+        for name in tab_modules:
+            self._add_module_tab(name)
+        self._restore_last_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    # ---------------- построение вкладок ----------------
+
+    def _build_convert_tab(self) -> None:
+        page = ttk.Frame(self.notebook)
+        try:
+            self.app = App(page, settings=self.settings)
+        except Exception as exc:
+            self.app = None
+            try:
+                page.destroy()
+            except Exception:
+                pass
+            self._add_error_tab(CONVERT_TAB_KEY, CONVERT_TAB_TITLE,
+                                "построение вкладки", exc)
+            return
+        self.notebook.add(page, text=CONVERT_TAB_TITLE)
+        self.tabs.append(TabRecord(CONVERT_TAB_KEY, CONVERT_TAB_TITLE, page))
+
+    def _add_module_tab(self, name: str) -> TabRecord | None:
+        key = name[4:] if name.startswith("tab_") else name
+        title = _TAB_FALLBACK_TITLES.get(name, key)
+        try:
+            module = _import_tab_module(name)
+        except (Exception, SystemExit) as exc:
+            return self._add_error_tab(key, title, "импорт модуля %s" % name, exc)
+        if module is None:
+            return None                           # вкладки нет - и ладно
+
+        declared = getattr(module, "TAB_TITLE", None)
+        if not (isinstance(declared, str) and declared.strip()):
+            return self._add_error_tab(key, title, "контракт модуля %s" % name,
+                                       TabContractError(
+                                           "в модуле %s нет строки TAB_TITLE" % name))
+        title = declared.strip()
+        build = getattr(module, "build_tab", None)
+        if not callable(build):
+            return self._add_error_tab(key, title, "контракт модуля %s" % name,
+                                       TabContractError(
+                                           "в модуле %s нет функции build_tab" % name))
+
+        before = set(self.notebook.winfo_children())
+        try:
+            frame = build(self.notebook, self.ctx)
+            if not isinstance(frame, tk.Misc):
+                raise TabContractError("build_tab вернула %s вместо фрейма"
+                                       % type(frame).__name__)
+            self.notebook.add(frame, text=title)
+        except (Exception, SystemExit) as exc:
+            # Полупостроенная вкладка не должна висеть в блокноте невидимкой.
+            for widget in set(self.notebook.winfo_children()) - before:
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
+            return self._add_error_tab(key, title, "построение вкладки", exc)
+        record = TabRecord(key, title, frame)
+        self.tabs.append(record)
+        return record
+
+    def _add_error_tab(self, key: str, title: str, stage: str,
+                       exc: BaseException) -> TabRecord:
+        """Панель «вкладка не загрузилась» вместо самой вкладки."""
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        path = record_error("вкладка «%s»: %s" % (title, stage), detail)
+        reason = "%s: %s" % (type(exc).__name__, exc)
+        missing = exc.name if isinstance(exc, ModuleNotFoundError) else None
+
+        def pal(role: str) -> str:
+            return gui_common.palette(role, self.root)
+
+        wrap = self.ctx.px(860)
+        page = ttk.Frame(self.notebook, padding=(18, 14))
+        page.columnconfigure(0, weight=1)
+        ttk.Label(page, text="Вкладка «%s» не загрузилась" % title,
+                  font="TkHeadingFont", foreground=pal("error")
+                  ).grid(row=0, column=0, sticky="w")
+        ttk.Label(page, text=("Остальные вкладки работают как обычно. "
+                              "Причина (%s):" % stage),
+                  foreground=pal("muted")
+                  ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(page, text=reason, wraplength=wrap, justify="left",
+                  foreground=pal("fg")
+                  ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+        row = 3
+        if missing:
+            top = missing.split(".")[0]
+            ttk.Label(page, text=("Не установлена библиотека %s. Установите её "
+                                  "командой:  python -m pip install %s"
+                                  % (missing, _PIP_NAMES.get(top, top))),
+                      foreground=pal("warn"), wraplength=wrap, justify="left"
+                      ).grid(row=row, column=0, sticky="w", pady=(8, 0))
+            row += 1
+        where = ttk.Frame(page)
+        where.grid(row=row, column=0, sticky="ew", pady=(10, 0))
+        where.columnconfigure(0, weight=1)
+        ttk.Label(where, text="Подробности записаны в файл:\n%s" % path,
+                  justify="left", foreground=pal("muted")
+                  ).grid(row=0, column=0, sticky="w")
+        ttk.Button(where, text="Показать журнал",
+                   command=lambda: self.ctx.reveal(path)
+                   ).grid(row=0, column=1, sticky="e")
+        row += 1
+
+        box = ttk.Frame(page)
+        box.grid(row=row, column=0, sticky="nsew", pady=(10, 0))
+        page.rowconfigure(row, weight=1)
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        text = tk.Text(box, height=12, wrap="none", font=monospace_font(self.root),
+                       background=pal("card_bg"), foreground=pal("fg"),
+                       insertbackground=pal("fg"), highlightthickness=1,
+                       highlightbackground=pal("card_border"), relief="flat")
+        text.insert("1.0", detail)
+        text.configure(state="disabled")
+        text.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        text.configure(yscrollcommand=vsb.set)
+
+        self.notebook.add(page, text=title)
+        record = TabRecord(key, title, page, error=reason)
+        self.tabs.append(record)
+        self.ctx.log("Вкладка «%s» не загрузилась: %s" % (title, reason), "error")
+        return record
+
+    # ---------------- активная вкладка ----------------
+
+    def current_key(self) -> str:
+        """Ключ открытой вкладки ("convert", "enhance", ...) или ""."""
+        try:
+            idx = self.notebook.index(self.notebook.select())
+        except Exception:
+            return ""
+        return self.tabs[idx].key if 0 <= idx < len(self.tabs) else ""
+
+    def select_tab(self, key: str) -> bool:
+        """Открыть вкладку по ключу.  False, если такой нет."""
+        for idx, rec in enumerate(self.tabs):
+            if rec.key == key:
+                try:
+                    self.notebook.select(idx)
+                    return True
+                except Exception:
+                    return False
+        return False
+
+    def _restore_last_tab(self) -> None:
+        key = self.settings.get("last_tab") or ""
+        if key:
+            self.select_tab(str(key))
+
+    def _on_tab_changed(self, _event=None) -> None:
+        key = self.current_key()
+        if not key:
+            return
+        previous = self.settings.get("last_tab") or (self.tabs[0].key if self.tabs else "")
+        if key == previous:
+            # Первый показ окна тоже присылает это событие.  Простой запуск
+            # программы не должен писать файл настроек.
+            return
+        self.settings["last_tab"] = key
+        if not self._closing:
+            self._save_all()
+
+    def _save_all(self) -> None:
+        """Записать настройки: поля конвертера живут в его tk-переменных."""
+        if self.app is not None:
+            try:
+                self.app._save_settings()
+                return
+            except Exception:
+                record_error("save settings", traceback.format_exc())
+        self.ctx.save_settings()
+
+    def _on_log(self, payload) -> None:
+        text, level = payload
+        self.status_var.set(text)
+        role = {"ok": "ok", "warn": "warn", "error": "error"}.get(level, "muted")
+        try:
+            self.status.configure(foreground=gui_common.palette(role, self.root))
+        except Exception:
+            pass
+
+    # ---------------- меню macOS: те же команды, что у App ----------------
+
+    def choose_dir(self) -> None:
+        if self.app is not None and self.select_tab(CONVERT_TAB_KEY):
+            self.app.choose_dir()
+
+    def choose_files(self) -> None:
+        if self.app is not None and self.select_tab(CONVERT_TAB_KEY):
+            self.app.choose_files()
+
+    def open_out_dir(self) -> None:
+        if self.app is not None and self.select_tab(CONVERT_TAB_KEY):
+            self.app.open_out_dir()
+
+    # ---------------- закрытие окна ----------------
+
+    def _busy(self) -> bool:
+        if self.ctx.active_jobs():
+            return True
+        app = self.app
+        return bool(app is not None and app.thread is not None
+                    and app.thread.is_alive())
+
+    def on_close(self) -> None:
+        """Отменить работу ВСЕХ вкладок -> дождаться с таймаутом -> закрыть."""
+        if self._closing:
+            try:
+                self.root.bell()
+            except Exception:
+                pass
+            return
+        self._closing = True
+        key = self.current_key()
+        if key:
+            self.settings["last_tab"] = key
+        # Колбэки закрытия вкладок и отмена их фоновых работ.
+        self.ctx.shutdown()
+        if self.app is not None:
+            self.app.cancel_evt.set()
+        self._close_deadline = time.monotonic() + CLOSE_TIMEOUT
+        if self._busy():
+            self.status_var.set("Завершение… ожидание фоновых работ (до %.0f с)"
+                                % CLOSE_TIMEOUT)
+        self._wait_close()
+
+    def _wait_close(self) -> None:
+        if self._busy() and time.monotonic() < self._close_deadline:
+            self.root.after(100, self._wait_close)
+            return
+        if not self._busy():
+            if self.app is not None:
+                # Его поток уже завершён: on_close сохранит настройки (весь
+                # общий словарь) и закроет окно сразу, без ожидания.
+                self.app.on_close()
+            else:
+                self.ctx.save_settings()
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+            return
+        # Кто-то не остановился за CLOSE_TIMEOUT.  Как и в App._wait_close:
+        # потоки пулов не демоны, и без os._exit процесс продолжал бы работу
+        # уже без окна.
+        names = [j.name for j in self.ctx.active_jobs()]
+        if self.app is not None and self.app.thread is not None \
+                and self.app.thread.is_alive():
+            names.append("конвертация")
+        record_error("close", "фоновые работы не завершились за %.0f с (%s); "
+                              "окно закрывается принудительно"
+                     % (CLOSE_TIMEOUT, ", ".join(names)))
+        self._save_all()
+        if self.app is not None:
+            self.app._destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
+
+
+# --------------------------------------------------------------------------
 # Точка входа
 # --------------------------------------------------------------------------
+
+
+#: Доля высоты экрана под рабочую область окна.  Остальное - заголовок окна
+#: (его нет в geometry) и панель задач или Dock (их нет в winfo_screenheight).
+#: При 0.9 на экране 2880x1800 со 200% низ окна уходил под панель задач Windows
+#: вместе с кнопками конвертера.
+_FIT_HEIGHT_SHARE = 0.8
+
+
+def _fit_geometry(root: tk.Tk, width: int, height: int) -> str:
+    """Размер и место окна: не больше экрана и не под панелью задач.
+
+    Окно ставится по центру по горизонтали и чуть выше середины по вертикали:
+    место, которое Windows выбирает само (каскад от левого верхнего угла),
+    вместе с высоким окном и уводило его низ за край рабочей области.
+    """
+    try:
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    except Exception:
+        return "%dx%d" % (width, height)
+    width = min(width, int(sw * 0.95))
+    height = min(height, int(sh * _FIT_HEIGHT_SHARE))
+    return "%dx%d+%d+%d" % (width, height, max(0, (sw - width) // 2),
+                            max(0, (sh - height) // 4))
+
+
+def _fit_clips_height(root: tk.Misc, height: int) -> bool:
+    """Не влезает ли окно высотой height в экран (см. _fit_geometry)."""
+    try:
+        return height > int(root.winfo_screenheight() * _FIT_HEIGHT_SHARE)
+    except Exception:
+        return False
+
+
+def _start_maximized(root: tk.Tk) -> None:
+    """Развернуть окно на весь экран, если система это умеет.
+
+    Нужно, когда окно не влезает по высоте (ноутбук со 150-200 %): в урезанном
+    окне таблица конвертера сжимается до одной строки заголовков, а развёрнутое
+    окно отдаёт ей всё, что остаётся над панелью задач.  Состояние «zoomed»
+    есть у Tk на Windows и macOS; на X11 это атрибут -zoomed.
+    """
+    try:
+        if IS_WINDOWS or IS_MACOS:
+            root.state("zoomed")
+        else:
+            root.attributes("-zoomed", True)
+    except tk.TclError:
+        pass
 
 
 def main() -> int:
@@ -2783,20 +3276,45 @@ def main() -> int:
     # macOS этот параметр не используют - там окно остаётся прежним.
     root = tk.Tk(className=APP_ID)
     install_crash_hooks(root)              # повторно: теперь и для tk-колбэков
-    # Заголовок обещает ровно то, что программа делает: достаёт из CR2 готовый
-    # JPEG камеры без перекодирования.  Прежний вариант упоминал DPP и наводил
-    # на мысль, что правки DPP как-то учитываются.
-    root.title("CR2 в JPEG (без потерь, как снято)")
+    if gui_common is None:
+        # Без общего модуля вкладок нет, но конвертер работать обязан.
+        record_error("gui_common", _GUI_COMMON_ERROR)
+        return _run_converter_only(root)
+    # Заголовок называет программу целиком и не обещает правок DPP: вкладка
+    # «Конвертация» по-прежнему достаёт готовый JPEG камеры как есть.
+    root.title("Медиа-инструменты ЮИ РУДН")
     apply_ui_theme(root)                   # vista / aqua / clam - по системе
     apply_default_ui_font(root)            # пустая операция на Windows и macOS
     honour_linux_scaling(root)             # пустая операция на Windows и macOS
     s = ui_scale(root)                     # уже с учётом строки выше
-    root.geometry("%dx%d" % (int(1020 * s), int(760 * s)))
+    want_w, want_h = int(1180 * s), int(820 * s)
+    root.geometry(_fit_geometry(root, want_w, want_h))
+    root.minsize(int(760 * s), int(560 * s))
+    if _fit_clips_height(root, want_h):
+        _start_maximized(root)
+    shell = Shell(root)
+    # Строка меню macOS, а главное - перехват Command+Q, который иначе прошёл бы
+    # мимо on_close вместе с несохранёнными настройками и работающими вкладками.
+    # На Windows и Linux ничего не делает.
+    install_macos_menubar(root, shell)
+    root.protocol("WM_DELETE_WINDOW", shell.on_close)
+    root.mainloop()
+    return 0
+
+
+def _run_converter_only(root: tk.Tk) -> int:
+    """Прежнее окно одного конвертера - запасной путь, если нет gui_common.py."""
+    # Заголовок обещает ровно то, что программа делает: достаёт из CR2 готовый
+    # JPEG камеры без перекодирования.  Прежний вариант упоминал DPP и наводил
+    # на мысль, что правки DPP как-то учитываются.
+    root.title("CR2 в JPEG (без потерь, как снято)")
+    apply_ui_theme(root)
+    apply_default_ui_font(root)
+    honour_linux_scaling(root)
+    s = ui_scale(root)
+    root.geometry(_fit_geometry(root, int(1020 * s), int(760 * s)))
     root.minsize(int(760 * s), int(560 * s))
     app = App(root)
-    # Строка меню macOS, а главное - перехват Command+Q, который иначе прошёл бы
-    # мимо on_close вместе с несохранёнными настройками.  На Windows и Linux
-    # ничего не делает.
     install_macos_menubar(root, app)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
