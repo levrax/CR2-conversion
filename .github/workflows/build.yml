@@ -219,6 +219,57 @@ jobs:
                   setattr(fd, n, _no_modal("filedialog." + n))
 
 
+          # Счётчики Tk: если тест висит внутри root.update(), значит какой-то
+          # обработчик бесконечно порождает новые события.  Сторож читает их из
+          # своего потока и называет виновника.  Исходно на macOS тест со всеми
+          # вкладками висел в update(), а на Windows не воспроизводился ничем.
+          import collections
+          TK_COUNTS = {"after": collections.Counter(), "event": collections.Counter()}
+
+
+          def _cb_name(func):
+              return (getattr(func, "__qualname__", None)
+                      or getattr(func, "__name__", None) or repr(func))[:90]
+
+
+          def _instrument_tk():
+              try:
+                  import tkinter as tk
+              except Exception:
+                  return
+              orig_after, orig_idle, orig_init = tk.Misc.after, tk.Misc.after_idle, tk.Tk.__init__
+
+              def after(self, ms, func=None, *args):
+                  # after_idle сам зовёт after("idle", ...) - его уже посчитали.
+                  if func is not None and ms != "idle":
+                      fast = "0-4ms" if isinstance(ms, int) and ms < 5 else "5ms+"
+                      TK_COUNTS["after"][("after " + fast, _cb_name(func))] += 1
+                  return orig_after(self, ms, func, *args)
+
+              def after_idle(self, func, *args):
+                  TK_COUNTS["after"][("after_idle", _cb_name(func))] += 1
+                  return orig_idle(self, func, *args)
+
+              def init(self, *a, **k):
+                  orig_init(self, *a, **k)
+                  for seq in ("<Configure>", "<<ThemeChanged>>", "<Map>", "<Expose>"):
+                      try:
+                          self.bind_all(seq, lambda e, s=seq: TK_COUNTS["event"].update(
+                              [(s, str(e.widget)[-80:])]), add="+")
+                      except Exception:
+                          pass
+
+              tk.Misc.after, tk.Misc.after_idle, tk.Tk.__init__ = after, after_idle, init
+
+
+          def _report_tk_counts():
+              for kind, counter in TK_COUNTS.items():
+                  top = counter.most_common(8)
+                  if top:
+                      print("\n::error::самые частые Tk %s:%%0A%s" % (kind, "%0A".join(
+                          "%8d  %s  %s" % (n, key[0], key[1]) for key, n in top)), flush=True)
+
+
           class Tracking(unittest.TextTestResult):
               current = "(тесты ещё не начались)"
 
@@ -244,11 +295,13 @@ jobs:
                     % stacks.replace("\r", "").replace("\n", "%0A"), flush=True)
               for where, text in DIALOGS:
                   print("\n::error::диалог в %s: %s" % (where, text), flush=True)
+              _report_tk_counts()
               os._exit(1)
 
 
           def main() -> int:
               _block_dialogs()
+              _instrument_tk()
               threading.Thread(target=_watchdog, daemon=True).start()
               suite = unittest.TestLoader().discover('.', pattern='test_*.py',
                                                      top_level_dir='.')
