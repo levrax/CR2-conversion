@@ -877,24 +877,55 @@ DEFAULT_SETTINGS: dict = {
 }
 
 
+def _cyrillic_score(text: str) -> int:
+    """Насколько строка похожа на настоящий русский текст.
+
+    Плюс за каждую кириллическую букву, минус за каждый прочий не-ASCII
+    символ.  Штраф обязателен: mac_cyrillic, применённый к байтам cp1251,
+    частично попадает в кириллицу и без штрафа мог бы выиграть у верной
+    кодировки ("‘ото" вместо "Фото").
+    """
+    cyr = junk = 0
+    for ch in text:
+        if "\u0400" <= ch <= "\u04ff":
+            cyr += 1
+        elif ord(ch) > 127:
+            junk += 1
+    return cyr - junk
+
+
 def _read_settings_text() -> str:
     """Сначала СТРОГИЙ UTF-8, и только потом кодировка системы.
 
     errors="replace" здесь недопустим: он никогда не бросает исключение, то есть
     запасная ветка стала бы мёртвым кодом, а путь с кириллицей превратился бы в
     строку из U+FFFD, которую программа при выходе записала бы поверх настроек.
+
+    По той же причине запасную кодировку НЕЛЬЗЯ выбирать как «первую, что не
+    бросила исключение».  Однобайтовые кодировки (cp1252, mac_cyrillic) не
+    бросают никогда: они отображают любой байт в какой-то символ.  Раньше на
+    английской Windows первой шла cp1252 и молча превращала «Фото» в «Ôîòî»,
+    а на macOS то же делала mac_cyrillic - настройки, перенесённые с русской
+    Windows, портились без единой ошибки.  На машине разработчика это не
+    проявлялось: там кодировка системы и есть cp1251.  Поэтому декодируем
+    всеми кандидатами и берём тот, что даёт настоящую кириллицу.
     """
     blob = SETTINGS_PATH.read_bytes()
     try:
         return blob.decode("utf-8")
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as utf8_error:
+        best = None
         for enc in legacy_text_encodings():
             try:
-                return blob.decode(enc)
+                text = blob.decode(enc)
             except (UnicodeDecodeError, LookupError):
-                pass
-        raise
-
+                continue
+            score = _cyrillic_score(text)
+            if best is None or score > best[0]:
+                best = (score, text)
+        if best is None:
+            raise utf8_error
+        return best[1]
 
 def load_settings() -> dict:
     """Прочитать настройки. Битый файл не теряем, а отводим в сторону."""

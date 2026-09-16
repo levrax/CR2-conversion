@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+from importlib.machinery import SourceFileLoader
 import io
 import os
 import subprocess
@@ -45,7 +46,11 @@ def load_gui():
             importlib.import_module(name)
         except BaseException as exc:
             raise unittest.SkipTest("%s недоступен: %s" % (name, exc))
-    spec = importlib.util.spec_from_file_location("cr2_gui", HERE / "cr2_gui.pyw")
+    # loader задаётся явно: importlib признаёт .pyw исходником только на
+    # Windows, а на macOS и Linux spec_from_file_location вернул бы None.
+    path = str(HERE / "cr2_gui.pyw")
+    spec = importlib.util.spec_from_file_location(
+        "cr2_gui", path, loader=SourceFileLoader("cr2_gui", path))
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cr2_gui"] = mod
     spec.loader.exec_module(mod)

@@ -2416,6 +2416,31 @@ class TestGuiModule(unittest.TestCase):
         self.assertTrue(loaded["src"].endswith("Фото"))
         self.assertEqual(loaded["quality"], 88)
 
+    def test_settings_survive_foreign_locale_encodings(self):
+        """Регрессия: cp1251-настройки не должны портиться на чужой локали.
+
+        Однобайтовые кодировки не бросают исключений, поэтому выбор «первой,
+        что не упала» молча давал мусор: на английской Windows cp1252
+        превращала «Фото» в «Ôîòî», на macOS то же делала mac_cyrillic.
+        На машине с русской Windows баг не виден - там кодировка системы и
+        есть cp1251, - поэтому локали здесь подменяются явно, чтобы тест
+        ловил его на любой машине, а не только в CI.
+        """
+        from unittest import mock
+        path = str(self.out / "Фото") + "/Съёмка ЮИ"
+        self.gui.SETTINGS_PATH = self.out / "s_locale.json"
+        for candidates in (("cp1252", "cp1251"),                  # англ. Windows
+                           ("utf-8", "mac_cyrillic", "cp1251"),   # macOS
+                           ("mac_cyrillic", "cp1251")):           # худший порядок
+            with self.subTest(candidates=candidates):
+                self.gui.save_settings(dict(self.gui.DEFAULT_SETTINGS, src=path))
+                text = self.gui.SETTINGS_PATH.read_bytes().decode("utf-8")
+                self.gui.SETTINGS_PATH.write_bytes(text.encode("cp1251"))
+                with mock.patch.object(self.gui, "legacy_text_encodings",
+                                       return_value=candidates):
+                    loaded = self.gui.load_settings()
+                self.assertEqual(loaded["src"], path)
+
     def test_broken_settings_are_quarantined_not_lost(self):
         self.gui.SETTINGS_PATH = self.out / "s2.json"
         self.gui.SETTINGS_PATH.write_bytes(b"{ not json")
