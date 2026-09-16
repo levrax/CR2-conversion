@@ -190,7 +190,8 @@ jobs:
 
           # Зависание в CI без этого не диагностируется вовсе: лог задачи закрыт
           # без авторизации, а при таймауте job не остаётся ни одной аннотации.
-          HANG_MINUTES = 15
+          # Windows проходит весь набор за ~4 мин; macOS медленнее, но не втрое.
+          HANG_MINUTES = 12
           DIALOGS = []
 
 
@@ -232,11 +233,17 @@ jobs:
                   faulthandler.dump_traceback(file=dump, all_threads=True)
                   dump.seek(0)
                   stacks = dump.read()[-1800:]
-              print("::error::%s: тесты не закончились за %d мин, завис на: %s%%0A%s"
-                    % (sys.platform, HANG_MINUTES, Tracking.current,
-                       stacks.replace("\r", "").replace("\n", "%0A")), flush=True)
+              # Ведущий "\n" обязателен.  Пока тест идёт, unittest уже напечатал
+              # "имя_теста ... " БЕЗ перевода строки, и без него ::error::
+              # оказывается в хвосте чужой строки - GitHub распознаёт команду
+              # только в начале строки и молча её игнорирует.  Именно так
+              # потерялся первый отчёт о зависании на macOS.
+              print("\n::error::%s: тесты не закончились за %d мин, завис на: %s"
+                    % (sys.platform, HANG_MINUTES, Tracking.current), flush=True)
+              print("\n::error::стек при зависании:%%0A%s"
+                    % stacks.replace("\r", "").replace("\n", "%0A"), flush=True)
               for where, text in DIALOGS:
-                  print("::error::диалог в %s: %s" % (where, text), flush=True)
+                  print("\n::error::диалог в %s: %s" % (where, text), flush=True)
               os._exit(1)
 
 
