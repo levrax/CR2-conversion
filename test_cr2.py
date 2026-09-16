@@ -1471,13 +1471,29 @@ class TestAtomicWrite(Base):
         self.assertEqual(len(names), 200)
 
     def test_temp_path_is_never_longer_than_the_destination(self):
+        """Временный файл принимается ОС всегда, когда принимается итоговый.
+
+        Контракт у _tmp_path свой на каждой платформе, и тест проверяет именно
+        его, а не одно правило для всех:
+
+        * Windows: жёсткий MAX_PATH, поэтому у длинного имени временный путь
+          не должен быть длиннее итогового - основа отрезается, а не растёт.
+        * macOS/Linux: единственный реальный предел - 255 БАЙТ на имя файла
+          (PATH_MAX 1024 для таких путей недостижим).  Путь законно
+          удлиняется на 13 символов, пока имя влезает в 255 байт.  Раньше тест
+          требовал и здесь виндовое «не длиннее» и падал на macOS при
+          stem=200: путь 264 против 251, хотя имя было всего 217 байт.
+        """
+        enc = sys.getfilesystemencoding() or "utf-8"
         for stem_len in (8, 200, 251, 255):
             with self.subTest(stem_len=stem_len):
                 dst = self.out / (("A" * stem_len) + ".jpg")
                 tmp = cr2_core._tmp_path(dst)
-                self.assertLessEqual(len(str(tmp)), len(str(dst)) if stem_len > 8
-                                     else len(str(tmp)))
+                # на любой платформе: имя укладывается в предел компонента
+                self.assertLessEqual(len(tmp.name.encode(enc, "surrogateescape")), 255)
                 self.assertLessEqual(len(tmp.name), 255)
+                if cr2_core._ON_NT and stem_len > 8:
+                    self.assertLessEqual(len(str(tmp)), len(str(dst)))
 
     def test_temp_name_fits_a_posix_byte_budget(self):
         """Регрессия: 255 считалось в СИМВОЛАХ, а APFS/HFS+/ext4 считают в БАЙТАХ.
