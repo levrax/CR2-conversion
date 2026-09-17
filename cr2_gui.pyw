@@ -2930,7 +2930,7 @@ class Shell:
 
         root.rowconfigure(0, weight=1)
         root.columnconfigure(0, weight=1)
-        self.notebook = ttk.Notebook(root)
+        self.notebook = ttk.Notebook(root, style=self._style_tabs(root))
         self.notebook.grid(row=0, column=0, sticky="nsew")
         self.status_var = tk.StringVar(value="")
         self.status = ttk.Label(root, textvariable=self.status_var, anchor="w",
@@ -2945,6 +2945,32 @@ class Shell:
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     # ---------------- построение вкладок ----------------
+
+    TAB_STYLE = "Shell.TNotebook"
+
+    def _style_tabs(self, root: tk.Misc) -> str:
+        """Крупные вкладки, похожие на кнопки, а не на строку текста.
+
+        На первом показе новых функций ярлыки «Отбор», «Обработка», «Афиши»
+        стандартного размера выглядели как подпись без рамок, и их не нашли.
+        Темы vista и aqua не дают менять цвет вкладок - только отступы и шрифт,
+        поэтому вкладки становятся шире, выше и полужирными.  Любая ошибка
+        оставляет обычный стиль: вид вкладок не повод не открыть окно.
+        """
+        try:
+            from tkinter import font as tkfont
+            base = tkfont.nametofont("TkDefaultFont", root).actual()
+            size = int(base.get("size") or 10)
+            # Положительный размер - в пунктах, отрицательный - в пикселях.
+            bigger = size + 2 if size > 0 else size - 3
+            self._tab_font = tkfont.Font(root, family=base.get("family"),
+                                         size=bigger, weight="bold")
+            ttk.Style(root).configure(
+                self.TAB_STYLE + ".Tab",
+                padding=(self.ctx.px(18), self.ctx.px(7)), font=self._tab_font)
+            return self.TAB_STYLE
+        except Exception:
+            return "TNotebook"
 
     def _build_convert_tab(self) -> None:
         page = ttk.Frame(self.notebook)

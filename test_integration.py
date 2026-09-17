@@ -203,6 +203,14 @@ class TestShellWithRealTabs(unittest.TestCase):
             pass
         gc.collect()        # мусор Tk - в потоке Tk, см. test_shell
 
+    def test_tabs_use_the_large_tab_style(self):
+        """Вкладки крупные: обычные мелкие ярлыки пользователь не нашёл."""
+        self.assertEqual(self.shell.notebook.cget("style"), self.gui.Shell.TAB_STYLE)
+        import tkinter.ttk as ttk
+        style = ttk.Style(self.root)
+        self.assertTrue(style.lookup(self.gui.Shell.TAB_STYLE + ".Tab", "padding"))
+        self.assertTrue(style.lookup(self.gui.Shell.TAB_STYLE + ".Tab", "font"))
+
     def test_all_four_tabs_load_without_error_panels(self):
         pump(self.root, timeout=0.3)
         self.assertEqual([t.key for t in self.shell.tabs],
