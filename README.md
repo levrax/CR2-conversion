@@ -12,9 +12,9 @@
 захотите уменьшать или поворачивать. В том же окне есть вкладки «Отбор»,
 «Обработка» и «Афиши» — см. «Вкладки окна».
 
-**Готовая сборка:** Windows 10/11 (64-bit) и **macOS 14 Sonoma или новее** (Apple
-Silicon и Intel) — входящие в неё OpenCV и numpy старше macOS не поддерживают. На
-macOS 11–13 запускайте из исходников: `python cr2_gui.pyw`.
+**📥 Скачать готовое приложение для Windows и Mac: [INSTALL.md](INSTALL.md).**
+Сборки: Windows 10/11 (64-bit) и macOS 14 Sonoma или новее (Apple Silicon и Intel);
+на macOS 11–13 запускайте из исходников: `python cr2_gui.pyw`.
 
 ---
 
@@ -254,7 +254,7 @@ python -m pip install -r requirements.txt
 | `test_shell.py`, `test_integration.py` | 39 тестов оболочки и 17 сквозных: все вкладки вместе, самопроверка, чистота репозитория |
 | `test_cull.py`, `test_enhance.py`, `test_poster.py`, `test_tab_cull.py`, `test_tab_enhance.py`, `test_tab_poster.py` | движки: 41, 53 и 46 тестов; вкладки: 26, 23 и 27 |
 | `make_test_cr2.py` | генератор синтетических `.CR2` для тестов |
-| `BUILD.md` | как собрать приложение и выпустить релиз |
+| `INSTALL.md`, `BUILD.md` | как скачать и установить; как собрать приложение и выпустить релиз |
 | `.gitignore`, `.gitattributes` | что не попадает в репозиторий (и шрифты без лицензии); LF в репозитории — CRLF ломает сборку |
 | `assets/` | значок приложения (`app.ico`, `app.icns`, `app.png`) — без него бандл уходит с логотипом PyInstaller |
 
