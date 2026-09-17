@@ -2,7 +2,7 @@
 """Тесты вкладки «Афиши» (tab_poster.py).
 
 Окно не показывается: корневое окно сразу прячется (withdraw), события
-прокачиваются root.update().  Без Tk (нет tcl/tk, нет дисплея) тесты
+прокачиваются drain_events(root).  Без Tk (нет tcl/tk, нет дисплея) тесты
 пропускаются, а не падают.  Фотографии - только синтетические, записанные во
 временную папку; экспорт - тоже только туда.
 
@@ -34,6 +34,17 @@ except Exception as exc:                        # pragma: no cover
     raise unittest.SkipTest("нет numpy/Pillow: %s" % exc)
 
 
+def drain_events(root) -> int:
+    """root.update() с ограничением - см. gui_common.drain_events.
+
+    На macOS update() у спрятанного окна может не вернуться вовсе.  Импорт
+    ленивый: без tkinter модуль тестов должен загружаться и честно пропускать
+    оконные тесты, а не падать при импорте.
+    """
+    from gui_common import drain_events as _drain
+    return _drain(root)
+
+
 def synthetic_photo(w: int = 1200, h: int = 800) -> Image.Image:
     """Кадр «человек у стены»: градиентный фон и светлый прямоугольник-лицо."""
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -61,7 +72,7 @@ def pump(root, until=lambda: False, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            root.update()
+            drain_events(root)
         except tk.TclError:
             return bool(until())
         if until():
@@ -117,7 +128,7 @@ class TabPosterTestCase(unittest.TestCase):
     def build(self):
         frame = self.tp.build_tab(self.nb, self.ctx)
         self.nb.add(frame, text=self.tp.TAB_TITLE)
-        self.root.update()
+        drain_events(self.root)
         return frame, frame.poster_tab
 
     def photo_file(self, name: str = "frame.jpg") -> Path:
@@ -224,7 +235,7 @@ class TestPreview(TabPosterTestCase):
         self.wait_preview(tab)
         for i in range(8):
             tab.set_field("headline", "Заголовок %d" % i)
-            self.root.update()
+            drain_events(self.root)
         self.wait_preview(tab)
         self.assertEqual(tab.shown_generation, tab.generation)
         self.assertEqual(tab.field_values()["headline"], "Заголовок 7")
@@ -329,7 +340,7 @@ class TestFacesProcessedAndTheme(TabPosterTestCase):
         self.wait_preview(tab)
         with mock.patch.object(self.gc, "is_dark_mode", return_value=True):
             tab.frame.event_generate("<<ThemeChanged>>")
-            self.root.update()
+            drain_events(self.root)
             dark = lambda role: self.gc.palette(role, dark=True)     # noqa: E731
             self.assertEqual(str(tab.fonts_label.cget("foreground")), dark("muted"))
             self.assertEqual(str(tab.banner.cget("background")), dark("card_bg"))

@@ -29,6 +29,17 @@ import cr2_core  # noqa: E402
 import make_test_cr2  # noqa: E402
 
 
+def drain_events(root) -> int:
+    """root.update() с ограничением - см. gui_common.drain_events.
+
+    На macOS update() у спрятанного окна может не вернуться вовсе.  Импорт
+    ленивый: без tkinter модуль тестов должен загружаться и честно пропускать
+    оконные тесты, а не падать при импорте.
+    """
+    from gui_common import drain_events as _drain
+    return _drain(root)
+
+
 def load_gui():
     """Импортировать cr2_gui.pyw под своим именем.
 
@@ -165,7 +176,7 @@ class TestGuiSmoke(unittest.TestCase):
             if app is None:
                 self.skipTest("в модуле нет класса App — нечего собирать")
             for _ in range(5):
-                root.update()
+                drain_events(root)
         finally:
             root.destroy()
 

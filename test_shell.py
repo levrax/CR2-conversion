@@ -2,7 +2,7 @@
 """Тесты оболочки с вкладками (cr2_gui.Shell) и общего модуля gui_common.
 
 Окна не показываются: корневое окно сразу прячется (withdraw), события
-прокачиваются root.update().  Если Tk недоступен (нет tcl/tk, нет дисплея),
+прокачиваются drain_events(root).  Если Tk недоступен (нет tcl/tk, нет дисплея),
 тесты, которым нужно окно, пропускаются, а не падают.
 
 Модули вкладок подставляются через sys.modules: настоящие tab_enhance /
@@ -34,6 +34,17 @@ if str(HERE) not in sys.path:
 TAB_NAMES = ("tab_cull", "tab_enhance", "tab_poster")
 REQUIRED_ROLES = ("fg", "muted", "ok", "warn", "error", "accent", "card_bg",
                   "card_border", "selection")
+
+
+def drain_events(root) -> int:
+    """root.update() с ограничением - см. gui_common.drain_events.
+
+    На macOS update() у спрятанного окна может не вернуться вовсе.  Импорт
+    ленивый: без tkinter модуль тестов должен загружаться и честно пропускать
+    оконные тесты, а не падать при импорте.
+    """
+    from gui_common import drain_events as _drain
+    return _drain(root)
 
 
 def load_gui():
@@ -76,7 +87,7 @@ def pump(root, until=lambda: False, timeout: float = 5.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            root.update()
+            drain_events(root)
         except tk.TclError:              # окно уничтожено
             return bool(until())
         if until():

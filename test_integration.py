@@ -31,6 +31,17 @@ TAB_NAMES = ("tab_cull", "tab_enhance", "tab_poster")          # порядок 
 NOT_SHIPPED = {".git", "build", "dist", "__pycache__", ".venv", "venv"}
 
 
+def drain_events(root) -> int:
+    """root.update() с ограничением - см. gui_common.drain_events.
+
+    На macOS update() у спрятанного окна может не вернуться вовсе.  Импорт
+    ленивый: без tkinter модуль тестов должен загружаться и честно пропускать
+    оконные тесты, а не падать при импорте.
+    """
+    from gui_common import drain_events as _drain
+    return _drain(root)
+
+
 def repo_files() -> list[Path]:
     """Файлы папки программы без сборки, кэшей и .git (os.walk с отсечением)."""
     out: list[Path] = []
@@ -66,7 +77,7 @@ def pump(root, until=lambda: False, timeout: float = 10.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            root.update()
+            drain_events(root)
         except tk.TclError:
             return bool(until())
         if until():
@@ -321,8 +332,13 @@ class TestConverterTimerDiesWithItsWindow(unittest.TestCase):
         spec.loader.exec_module(gui)
         root.withdraw()
         gui.App(root)
+        import _tkinter
         for _ in range(3):
-            root.update()
+            # update() с ограничением (как gui_common.drain_events): на macOS
+            # update() у спрятанного окна может не вернуться вовсе.
+            for _n in range(5000):
+                if not root.tk.dooneevent(_tkinter.DONT_WAIT):
+                    break
         root.destroy()
         other = tk.Tk()
         other.withdraw()
@@ -464,3 +480,32 @@ class TestReleaseHygiene(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestAppCodeNeverCallsUpdate(unittest.TestCase):
+    """Рабочий код не вызывает update(): на macOS он может не вернуться.
+
+    Из-за этого в CI тест со всеми вкладками простоял в одном update()
+    двенадцать минут.  Приложение живёт в mainloop() и от этого защищено, пока
+    никто не вставит update() в сам код - этот тест и следит.  Смотрит только
+    настоящие вызовы (токены), а не упоминания в строках и комментариях.
+    """
+
+    def test_no_update_calls(self):
+        import io as _io
+        import tokenize
+        root = Path(__file__).resolve().parent
+        files = [root / "cr2_gui.pyw", root / "gui_common.py",
+                 *sorted(root.glob("tab_*.py"))]
+        bad = []
+        for f in files:
+            toks = [t for t in tokenize.generate_tokens(
+                        _io.StringIO(f.read_text(encoding="utf-8")).readline)
+                    if t.type not in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
+                                      tokenize.INDENT, tokenize.DEDENT)]
+            for i in range(len(toks) - 3):
+                a, b, c, d = toks[i:i + 4]
+                if (a.string == "." and b.type == tokenize.NAME
+                        and b.string in ("update", "update_idletasks")
+                        and c.string == "(" and d.string == ")"):
+                    bad.append("%s:%d" % (f.name, b.start[0]))
+        self.assertEqual(bad, [], "update() в рабочем коде: " + ", ".join(bad))

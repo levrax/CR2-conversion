@@ -56,7 +56,7 @@ __all__ = [
     "AppContext", "BackgroundJob", "Cancelled", "ImageLoadError", "Reporter",
     "IMAGE_EXTENSIONS", "IMAGE_FILETYPES", "RAW_EXTENSIONS", "PALETTE_ROLES",
     "POLL_MS", "TOPIC_LOG", "TOPIC_PROCESSED", "TOPIC_SELECTION",
-    "is_dark_mode", "is_tk_thread", "list_images", "load_image_fast", "path_key",
+    "drain_events", "is_dark_mode", "is_tk_thread", "list_images", "load_image_fast", "path_key",
     "palette", "photo_image", "pick_files", "pick_folder", "pick_save_file",
     "run_background", "run_standalone", "system_prefers_dark", "thumbnail",
 ]
@@ -90,6 +90,31 @@ _tk_thread: threading.Thread = threading.main_thread()
 def is_tk_thread() -> bool:
     """True, если код выполняется в потоке Tk (там, где можно трогать виджеты)."""
     return threading.current_thread() is _tk_thread
+
+
+def drain_events(widget: tk.Misc, limit: int = 5000) -> int:
+    """Обработать накопившиеся события Tk, но не больше limit за один вызов.
+
+    Замена root.update() там, где очередь нужно прокрутить вне mainloop
+    (тесты).  На macOS root.update() у спрятанного окна может не вернуться
+    вовсе: в CI тест со всеми вкладками простоял в одном update() двенадцать
+    минут, хотя из Python за это время выполнялись только два штатных таймера
+    по 60 мс - бесконечную работу делал сам Tk Aqua.  Здесь каждое событие
+    обрабатывается через dooneevent(DONT_WAIT), и число их ограничено.
+    Рабочий код программы update() не вызывает вовсе - только mainloop().
+    Возвращает число обработанных событий.
+    """
+    import _tkinter
+    app = widget.tk
+    done = 0
+    while done < limit:
+        try:
+            if not app.dooneevent(_tkinter.DONT_WAIT):
+                break
+        except tk.TclError:             # окно уже уничтожено
+            break
+        done += 1
+    return done
 
 
 def _require_tk_thread(what: str) -> None:

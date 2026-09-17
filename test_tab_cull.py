@@ -2,7 +2,7 @@
 """Тесты вкладки «Отбор» (tab_cull.py).
 
 Окна не показываются: корневое окно сразу прячется (withdraw), события
-прокачиваются root.update().  Без Tk (нет tcl/tk, нет дисплея) тесты, которым
+прокачиваются drain_events(root).  Без Tk (нет tcl/tk, нет дисплея) тесты, которым
 нужно окно, пропускаются.  Снимки - только синтетические, во временной папке;
 поиск лиц выключен, чтобы результат не зависел от OpenCV на машине CI.
 """
@@ -42,6 +42,17 @@ import gui_common  # noqa: E402
 import tab_cull  # noqa: E402
 
 BASE = datetime(2011, 4, 23, 21, 0, 0)           # часы камеры врут - как в жизни
+
+
+def drain_events(root) -> int:
+    """root.update() с ограничением - см. gui_common.drain_events.
+
+    На macOS update() у спрятанного окна может не вернуться вовсе.  Импорт
+    ленивый: без tkinter модуль тестов должен загружаться и честно пропускать
+    оконные тесты, а не падать при импорте.
+    """
+    from gui_common import drain_events as _drain
+    return _drain(root)
 
 
 def scene(seed: int, blur: float = 0.0) -> Image.Image:
@@ -96,11 +107,11 @@ def snapshot(folder: Path) -> dict[str, tuple[int, int]]:
 def pump(root: tk.Misc, until=lambda: False, timeout: float = 20.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        root.update()
+        drain_events(root)
         if until():
             return True
         time.sleep(0.005)
-    root.update()
+    drain_events(root)
     return bool(until())
 
 
@@ -357,7 +368,7 @@ class TestTab(_Base):
         burst = self.multi_burst()
         self.tab.set_ticked(burst.id, True)
         self.tab.expand_burst(burst.id)
-        self.root.update()
+        drain_events(self.root)
         self.assertEqual(sorted(self.tab.panel_orders()), sorted(burst.members))
         self.assertEqual(self.tab.card_text(burst.id, "link"),
                          "серия из %d — свернуть" % burst.size)
@@ -416,7 +427,7 @@ class TestTab(_Base):
         self.tab.set_sort(tab_cull.SORT_EVENT)
         self.tab.set_ticked(2, True)
         self.tab.set_only_ticked(True)
-        self.root.update()
+        drain_events(self.root)
         self.assertEqual(self.tab.visible_burst_ids(), [2])
         shown = [b for b, c in self.tab.cards.items()
                  if c.shown and self.tab.canvas.itemcget(c.items["bg"], "state") != "hidden"]

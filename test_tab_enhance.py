@@ -2,7 +2,7 @@
 """Тесты вкладки «Обработка» (tab_enhance.py).
 
 Окно не показывается: корневое окно сразу прячется (withdraw), события
-прокачиваются root.update().  Без Tk (нет tcl/tk, нет дисплея) тесты, которым
+прокачиваются drain_events(root).  Без Tk (нет tcl/tk, нет дисплея) тесты, которым
 нужно окно, пропускаются, а не падают.  Снимки - только синтетические,
 записанные во временную папку; результат пакета - тоже только туда.
 
@@ -35,6 +35,17 @@ except Exception as exc:                        # pragma: no cover
     raise unittest.SkipTest("нет numpy/Pillow: %s" % exc)
 
 
+def drain_events(root) -> int:
+    """root.update() с ограничением - см. gui_common.drain_events.
+
+    На macOS update() у спрятанного окна может не вернуться вовсе.  Импорт
+    ленивый: без tkinter модуль тестов должен загружаться и честно пропускать
+    оконные тесты, а не падать при импорте.
+    """
+    from gui_common import drain_events as _drain
+    return _drain(root)
+
+
 def synthetic_photo(w: int = 900, h: int = 600, seed: int = 0) -> Image.Image:
     """Тёмный «зал»: градиент, полосы и светлое пятно-лицо."""
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -62,7 +73,7 @@ def pump(root, until=lambda: False, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            root.update()
+            drain_events(root)
         except tk.TclError:
             return bool(until())
         if until():
@@ -189,7 +200,7 @@ class TabEnhanceTestCase(unittest.TestCase):
     def build(self):
         frame = self.te.build_tab(self.nb, self.ctx)
         self.nb.add(frame, text=self.te.TAB_TITLE)
-        self.root.update()
+        drain_events(self.root)
         return frame, frame.enhance_tab
 
     def photos(self, n: int = 3, folder: str = "src") -> list[Path]:
@@ -302,7 +313,7 @@ class TestPreview(TabEnhanceTestCase):
         self.assertEqual(tab.canvas.itemcget("after", "image"), str(tab._after_tk))
 
         tab.set_split(0.3)
-        self.root.update()
+        drain_events(self.root)
         _x0, _y0, w, _h = tab._split_geom
         self.assertEqual(int(tab._split_tk.cget("width")), round(w * 0.3))
 
@@ -369,7 +380,7 @@ class TestPreview(TabEnhanceTestCase):
         with mock.patch.object(self.te.enhance, "preview", side_effect=counted),                 mock.patch.object(self.te, "DEBOUNCE_MS", 600):
             for v in range(10, 60, 5):          # «тянем» ползунок: 10 движений
                 tab.enhance_var.set(v)
-                self.root.update()
+                drain_events(self.root)
             self.wait_preview(tab)
         self.assertLessEqual(len(calls), 2)
         self.assertEqual(calls[-1], 0.55)
@@ -553,7 +564,7 @@ class TestBatch(TabEnhanceTestCase):
         # Смена темы перекрашивает строку состояния в цвет той же роли.
         tab.batch_status.configure(foreground="#123456")
         tab.frame.event_generate("<<ThemeChanged>>")
-        self.root.update()
+        drain_events(self.root)
         self.assertEqual(str(tab.batch_status.cget("foreground")),
                          self.gc.palette("warn", tab.frame))
 
